@@ -13,6 +13,7 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.core.single_type_kv_cache_manager import (
     FullAttentionManager,
     SingleTypeKVCacheManager,
+    SlidingWindowManager,
     spec_manager_map,
 )
 from vllm.v1.kv_cache_interface import (
@@ -20,9 +21,12 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
 )
 from vllm.v1.request import Request
+
+from vllm_ascend.core.block_pool import AscendDSV4BlockPool
 
 
 class CompressAttentionManager(FullAttentionManager):
@@ -233,6 +237,134 @@ class CompressAttentionManager(FullAttentionManager):
         return computed_blocks
 
 
+class AscendDSV4SlidingWindowManager(SlidingWindowManager):
+    """DeepSeek-V4 SWA manager with LCM-aligned sparse APC writes.
+
+    vLLM 0.21 can read an SWA prefix only when a complete window tail ends on
+    the hybrid coordinator's alignment boundary. Cache only those reachable
+    tails, plus the one-block EAGLE/MTP lookahead when enabled.
+    """
+
+    def __init__(self, kv_cache_spec: SlidingWindowMLASpec, **kwargs) -> None:
+        super().__init__(kv_cache_spec, **kwargs)
+        self.use_eagle = False
+        # Replaced with the true hybrid LCM by the coordinator after grouping.
+        self.scheduler_block_size = self.block_size
+
+    @classmethod
+    def _contiguous_blocks_for_hit(
+        cls,
+        window_size: int,
+        block_size: int,
+        use_eagle: bool,
+    ) -> int:
+        blocks = cdiv(window_size - 1, block_size)
+        if use_eagle:
+            blocks += 1
+        return blocks
+
+    @classmethod
+    def reachable_block_mask(
+        cls,
+        start_block: int,
+        end_block: int,
+        alignment_tokens: int,
+        kv_cache_spec: KVCacheSpec,
+        use_eagle: bool,
+    ) -> list[bool] | None:
+        assert isinstance(kv_cache_spec, SlidingWindowMLASpec)
+        block_size = kv_cache_spec.block_size
+        assert alignment_tokens % block_size == 0
+
+        blocks_per_segment = alignment_tokens // block_size
+        required_blocks = cls._contiguous_blocks_for_hit(
+            window_size=kv_cache_spec.sliding_window,
+            block_size=block_size,
+            use_eagle=use_eagle,
+        )
+        if required_blocks >= blocks_per_segment:
+            return None
+
+        # With EAGLE, the last matched block is dropped by the read path. Keep
+        # the first block of the next segment as that lookahead checkpoint.
+        shift = 1 if use_eagle else 0
+        return [
+            block_idx >= shift and (block_idx - shift) % blocks_per_segment >= blocks_per_segment - required_blocks
+            for block_idx in range(start_block, end_block)
+        ]
+
+    def cache_blocks(self, request: Request, num_tokens: int) -> None:
+        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+        num_full_blocks = num_tokens // self.block_size
+        if num_cached_blocks >= num_full_blocks:
+            return
+
+        block_mask = self.reachable_block_mask(
+            start_block=num_cached_blocks,
+            end_block=num_full_blocks,
+            alignment_tokens=self.scheduler_block_size,
+            kv_cache_spec=self.kv_cache_spec,
+            use_eagle=self.use_eagle,
+        )
+        assert isinstance(self.block_pool, AscendDSV4BlockPool)
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=self.req_to_blocks[request.request_id],
+            num_cached_blocks=num_cached_blocks,
+            num_full_blocks=num_full_blocks,
+            block_size=self.block_size,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_mask=block_mask,
+        )
+        # Masked scratch blocks are intentionally processed only once.
+        self.num_cached_block[request.request_id] = num_full_blocks
+
+    def remove_skipped_blocks(
+        self,
+        request_id: str,
+        total_computed_tokens: int,
+    ) -> None:
+        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+        if num_skipped_tokens <= 0:
+            return
+
+        blocks = self.req_to_blocks[request_id]
+        num_skipped_blocks = min(
+            num_skipped_tokens // self.block_size,
+            len(blocks),
+        )
+        cached_blocks: list[KVCacheBlock] = []
+        scratch_blocks: list[KVCacheBlock] = []
+        for block_idx in range(num_skipped_blocks - 1, -1, -1):
+            block = blocks[block_idx]
+            if block == self._null_block:
+                break
+            if block.block_hash is None:
+                scratch_blocks.append(block)
+            else:
+                cached_blocks.append(block)
+            blocks[block_idx] = self._null_block
+
+        assert isinstance(self.block_pool, AscendDSV4BlockPool)
+        self.block_pool.free_blocks(cached_blocks)
+        self.block_pool.free_blocks(scratch_blocks, prepend=True)
+
+    def free(self, request_id: str) -> None:
+        req_blocks = self.req_to_blocks.pop(request_id, [])
+        if req_blocks:
+            cached_blocks: list[KVCacheBlock] = []
+            scratch_blocks: list[KVCacheBlock] = []
+            for block in reversed(req_blocks):
+                if block.block_hash is None:
+                    scratch_blocks.append(block)
+                else:
+                    cached_blocks.append(block)
+            assert isinstance(self.block_pool, AscendDSV4BlockPool)
+            self.block_pool.free_blocks(cached_blocks)
+            self.block_pool.free_blocks(scratch_blocks, prepend=True)
+        self.num_cached_block.pop(request_id, None)
+
+
 def get_manager_for_kv_cache_spec(
     kv_cache_spec: KVCacheSpec,
     max_num_batched_tokens: int | None = None,
@@ -256,27 +388,38 @@ def get_manager_for_kv_cache_spec(
     this value matches the pool sizer and makes admission consistent with the
     block budget actually held.
     """
-    manager_class = spec_manager_map[type(kv_cache_spec)]
-    if isinstance(kv_cache_spec, MLAAttentionSpec) and kv_cache_spec.compress_ratio > 1:
-        manager_class = CompressAttentionManager
-        if max_model_len is not None:
-            # Compressed-MLA peak in blocks: ceil(max_model_len/compress/block).
-            compress_ratio = kv_cache_spec.compress_ratio
-            block_size = kv_cache_spec.block_size
-            max_compressed_tokens = max_model_len // compress_ratio
-            kwargs["max_admission_blocks_per_request"] = cdiv(max_compressed_tokens, block_size) + 1
-    elif isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
-        # Replicate the upstream PR #40946 cap setting for recycling specs.
-        # We override the vLLM factory above, so the upstream block that does
-        # this lives in dead code (never reached); without re-applying it here
-        # SlidingWindowMLASpec / ChunkedLocalAttentionSpec groups have no cap
-        # and ``full_sequence_must_fit`` admission reserves the full
-        # ``max_model_len`` worth of blocks per request, exhausting the pool
-        # at cc>=2 on DSv4 (see vLLM issue #40863).
+    if (
+        isinstance(kv_cache_spec, SlidingWindowMLASpec)
+        and getattr(kv_cache_spec, "model_version", None) == "deepseek_v4"
+    ):
+        manager_class = AscendDSV4SlidingWindowManager
         if max_num_batched_tokens is not None and max_model_len is not None:
             kwargs["max_admission_blocks_per_request"] = kv_cache_spec.max_admission_blocks_per_request(
                 max_num_batched_tokens=max_num_batched_tokens,
                 max_model_len=max_model_len,
             )
+    else:
+        manager_class = spec_manager_map[type(kv_cache_spec)]
+        if isinstance(kv_cache_spec, MLAAttentionSpec) and kv_cache_spec.compress_ratio > 1:
+            manager_class = CompressAttentionManager
+            if max_model_len is not None:
+                # Compressed-MLA peak in blocks: ceil(max_model_len/compress/block).
+                compress_ratio = kv_cache_spec.compress_ratio
+                block_size = kv_cache_spec.block_size
+                max_compressed_tokens = max_model_len // compress_ratio
+                kwargs["max_admission_blocks_per_request"] = cdiv(max_compressed_tokens, block_size) + 1
+        elif isinstance(kv_cache_spec, (SlidingWindowSpec, ChunkedLocalAttentionSpec)):
+            # Replicate the upstream PR #40946 cap setting for recycling specs.
+            # We override the vLLM factory above, so the upstream block that does
+            # this lives in dead code (never reached); without re-applying it here
+            # SlidingWindowMLASpec / ChunkedLocalAttentionSpec groups have no cap
+            # and ``full_sequence_must_fit`` admission reserves the full
+            # ``max_model_len`` worth of blocks per request, exhausting the pool
+            # at cc>=2 on DSv4 (see vLLM issue #40863).
+            if max_num_batched_tokens is not None and max_model_len is not None:
+                kwargs["max_admission_blocks_per_request"] = kv_cache_spec.max_admission_blocks_per_request(
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    max_model_len=max_model_len,
+                )
     manager = manager_class(kv_cache_spec, **kwargs)
     return manager

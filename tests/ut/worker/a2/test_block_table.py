@@ -14,6 +14,7 @@
 #
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -21,6 +22,7 @@ import torch
 
 # import vllm.utils.cpu_triton_utils as cpu_tl
 from vllm.distributed.parallel_state import GroupCoordinator
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec, UniformTypeKVCacheSpecs
 
 from tests.ut.base import TestBase
 
@@ -44,7 +46,15 @@ class TestBlockTableComputeSlotMapping(TestBase):
         self.kernel_sizes = [128]
         self._skip_triton_kernel = True
 
-    def create_block_table(self, dcp_world_size, dcp_rank, pcp_world_size, pcp_rank, cp_kv_cache_interleave_size):
+    def create_block_table(
+        self,
+        dcp_world_size,
+        dcp_rank,
+        pcp_world_size,
+        pcp_rank,
+        cp_kv_cache_interleave_size,
+        kv_cache_group=None,
+    ):
         """Helper method to create BlockTable with mocked distributed groups"""
 
         with (
@@ -75,9 +85,51 @@ class TestBlockTableComputeSlotMapping(TestBase):
                 kernel_sizes=self.kernel_sizes,
                 cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
                 num_speculative_tokens=0,
+                kv_cache_group=kv_cache_group,
             )
 
             return block_table
+
+    def test_compressed_uniform_spec_scales_max_blocks_per_request(self):
+        for compress_ratio, expected_max_blocks in ((4, 32), (128, 1)):
+            with self.subTest(compress_ratio=compress_ratio):
+                inner_spec = SimpleNamespace(compress_ratio=compress_ratio)
+                uniform_spec = UniformTypeKVCacheSpecs(
+                    block_size=self.block_size,
+                    kv_cache_specs={"layer": inner_spec},
+                )
+                kv_cache_group = KVCacheGroupSpec(
+                    layer_names=["layer"],
+                    kv_cache_spec=uniform_spec,
+                )
+
+                block_table = self.create_block_table(
+                    dcp_world_size=1,
+                    dcp_rank=0,
+                    pcp_world_size=1,
+                    pcp_rank=0,
+                    cp_kv_cache_interleave_size=1,
+                    kv_cache_group=kv_cache_group,
+                )
+
+                self.assertEqual(block_table.max_num_blocks_per_req, expected_max_blocks)
+                self.assertEqual(block_table.block_table.np.shape[1], expected_max_blocks)
+
+    def test_direct_compressed_spec_is_still_supported(self):
+        kv_cache_group = SimpleNamespace(
+            kv_cache_spec=SimpleNamespace(compress_ratio=4),
+        )
+
+        block_table = self.create_block_table(
+            dcp_world_size=1,
+            dcp_rank=0,
+            pcp_world_size=1,
+            pcp_rank=0,
+            cp_kv_cache_interleave_size=1,
+            kv_cache_group=kv_cache_group,
+        )
+
+        self.assertEqual(block_table.max_num_blocks_per_req, 32)
 
     def setup_block_table_data(self, block_table, num_reqs=2):
         """Helper method to populate block table with test data"""

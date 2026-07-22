@@ -14,9 +14,14 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.core.block_pool import AscendDSV4BlockPool
+from vllm_ascend.core.single_type_kv_cache_manager import (
+    AscendDSV4SlidingWindowManager,
+)
 from vllm_ascend.patch.platform.patch_kv_cache_coordinator import (
     AscendHybridKVCacheCoordinator,
     _is_deepseek_v4_kv_cache_spec,
@@ -87,6 +92,60 @@ def _make_deepseek_v4_kv_cache_config() -> KVCacheConfig:
         kv_cache_groups=[
             KVCacheGroupSpec(layer_names=["c4_attn"], kv_cache_spec=c4_group_spec),
             KVCacheGroupSpec(layer_names=["c128_attn"], kv_cache_spec=c128_group_spec),
+        ],
+    )
+
+
+def _make_deepseek_v4_apc_config(block_size: int) -> KVCacheConfig:
+    c4_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=4,
+        model_version="deepseek_v4",
+    )
+    c128_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float16,
+        compress_ratio=128,
+        model_version="deepseek_v4",
+    )
+    swa_spec = SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float16,
+        sliding_window=128,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    state_spec = SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float16,
+        sliding_window=128,
+        compress_ratio=1,
+        model_version=None,
+    )
+    group_specs = [
+        UniformTypeKVCacheSpecs.from_specs({"c4_attn": c4_spec}),
+        UniformTypeKVCacheSpecs.from_specs({"c128_attn": c128_spec}),
+        UniformTypeKVCacheSpecs.from_specs({"swa_attn": swa_spec}),
+        UniformTypeKVCacheSpecs.from_specs({"state_attn": state_spec}),
+    ]
+    assert all(spec is not None for spec in group_specs)
+    return KVCacheConfig(
+        num_blocks=300,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(layer_names=["c4_attn"], kv_cache_spec=group_specs[0]),
+            KVCacheGroupSpec(layer_names=["c128_attn"], kv_cache_spec=group_specs[1]),
+            KVCacheGroupSpec(layer_names=["swa_attn"], kv_cache_spec=group_specs[2]),
+            KVCacheGroupSpec(layer_names=["state_attn"], kv_cache_spec=group_specs[3]),
         ],
     )
 
@@ -302,6 +361,178 @@ def test_get_kv_cache_coordinator_uses_ascend_for_deepseek_v4(monkeypatch) -> No
     )
 
     assert coordinator is sentinel
+
+
+class _FakeEagleManager:
+    def __init__(self) -> None:
+        self.use_eagle = False
+
+
+def test_verify_and_split_propagates_eagle_to_managers() -> None:
+    """The MTP bit must reach the manager used by the SWA write mask."""
+    kv_cache_config = _make_deepseek_v4_kv_cache_config()
+    coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
+    coordinator.kv_cache_config = kv_cache_config
+    coordinator.dcp_world_size = 1
+    coordinator.pcp_world_size = 1
+    coordinator.enable_caching = True
+    coordinator.eagle_group_ids = {1}
+    coordinator.single_type_managers = (_FakeEagleManager(), _FakeEagleManager())
+
+    coordinator.verify_and_split_kv_cache_groups()
+
+    assert coordinator.single_type_managers[1].use_eagle is True
+    assert coordinator.single_type_managers[0].use_eagle is False
+
+
+def test_verify_and_split_propagates_eagle_to_merged_spec_siblings() -> None:
+    """All same-spec siblings share the EAGLE read and write contract."""
+    base_config = _make_deepseek_v4_kv_cache_config()
+    c128_group_spec = base_config.kv_cache_groups[1].kv_cache_spec
+    kv_cache_config = KVCacheConfig(
+        num_blocks=base_config.num_blocks,
+        kv_cache_tensors=base_config.kv_cache_tensors,
+        kv_cache_groups=[
+            base_config.kv_cache_groups[0],
+            base_config.kv_cache_groups[1],
+            KVCacheGroupSpec(
+                layer_names=["c128_attn_mtp"],
+                kv_cache_spec=c128_group_spec,
+            ),
+        ],
+    )
+    coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
+    coordinator.kv_cache_config = kv_cache_config
+    coordinator.dcp_world_size = 1
+    coordinator.pcp_world_size = 1
+    coordinator.enable_caching = True
+    coordinator.eagle_group_ids = {2}
+    coordinator.single_type_managers = (
+        _FakeEagleManager(),
+        _FakeEagleManager(),
+        _FakeEagleManager(),
+    )
+
+    coordinator.verify_and_split_kv_cache_groups()
+
+    assert coordinator.single_type_managers[1].use_eagle is True
+    assert coordinator.single_type_managers[2].use_eagle is True
+    assert coordinator.single_type_managers[0].use_eagle is False
+
+
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_deepseek_v4_effective_lcm_uses_c128_compression(block_size: int) -> None:
+    coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
+    coordinator.kv_cache_config = _make_deepseek_v4_apc_config(block_size)
+    coordinator.dcp_world_size = 1
+    coordinator.pcp_world_size = 1
+    coordinator.enable_caching = True
+    coordinator.eagle_group_ids = set()
+    coordinator.single_type_managers = tuple(_FakeEagleManager() for _ in coordinator.kv_cache_config.kv_cache_groups)
+
+    coordinator.verify_and_split_kv_cache_groups()
+
+    assert coordinator.lcm_block_size == block_size * 128
+
+
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_deepseek_v4_coordinator_injects_scoped_apc_components(
+    block_size: int,
+) -> None:
+    coordinator = AscendHybridKVCacheCoordinator(
+        kv_cache_config=_make_deepseek_v4_apc_config(block_size),
+        max_model_len=block_size * 256,
+        max_num_batched_tokens=4096,
+        use_eagle=False,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=block_size,
+    )
+
+    assert isinstance(coordinator.block_pool, AscendDSV4BlockPool)
+    swa_managers = [
+        manager for manager in coordinator.single_type_managers if isinstance(manager, AscendDSV4SlidingWindowManager)
+    ]
+    assert len(swa_managers) == 1
+    assert swa_managers[0].scheduler_block_size == block_size * 128
+    assert any(manager.kv_cache_spec.model_version is None for manager in coordinator.single_type_managers)
+
+
+@pytest.mark.parametrize(
+    ("block_size", "tail_blocks"),
+    [
+        pytest.param(32, 4, id="block-32"),
+        pytest.param(64, 2, id="block-64"),
+        pytest.param(128, 1, id="block-128"),
+    ],
+)
+@pytest.mark.parametrize("use_eagle", [False, True], ids=["no-mtp", "mtp"])
+def test_deepseek_v4_swa_reachable_mask(
+    block_size: int,
+    tail_blocks: int,
+    use_eagle: bool,
+) -> None:
+    alignment_tokens = block_size * 128
+    spec = SlidingWindowMLASpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=512,
+        dtype=torch.float16,
+        sliding_window=128,
+        compress_ratio=1,
+        model_version="deepseek_v4",
+    )
+    # Include exactly two complete LCM segments. MTP additionally computes the
+    # first SWA block after the second boundary as its lookahead block.
+    end_block = 2 * 128 + int(use_eagle)
+
+    mask = AscendDSV4SlidingWindowManager.reachable_block_mask(
+        start_block=0,
+        end_block=end_block,
+        alignment_tokens=alignment_tokens,
+        kv_cache_spec=spec,
+        use_eagle=use_eagle,
+    )
+
+    assert mask is not None
+    actual_indices = {index for index, reachable in enumerate(mask) if reachable}
+    expected_indices: set[int] = set()
+    for boundary in (128, 256):
+        expected_indices.update(range(boundary - tail_blocks, boundary))
+        if use_eagle:
+            expected_indices.add(boundary)
+    assert actual_indices == expected_indices
+
+
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+@pytest.mark.parametrize("use_eagle", [False, True], ids=["no-mtp", "mtp"])
+def test_deepseek_v4_cache_writes_are_lcm_aligned(
+    block_size: int,
+    use_eagle: bool,
+) -> None:
+    coordinator = AscendHybridKVCacheCoordinator.__new__(AscendHybridKVCacheCoordinator)
+    coordinator.is_deepseek_v4 = True
+    coordinator.lcm_block_size = block_size * 128
+    manager = SimpleNamespace(
+        block_size=block_size,
+        use_eagle=use_eagle,
+        cache_blocks=MagicMock(),
+    )
+    coordinator.single_type_managers = (manager,)
+    request = MagicMock()
+    num_computed_tokens = 2 * coordinator.lcm_block_size + block_size
+
+    coordinator.cache_blocks(request, num_computed_tokens)
+
+    expected_tokens = 2 * coordinator.lcm_block_size
+    if use_eagle:
+        expected_tokens += block_size
+    call = manager.cache_blocks.call_args
+    assert call is not None
+    assert call.args[0] is request
+    assert call.args[1] == expected_tokens
 
 
 def test_deepseek_v4_detection_handles_non_mapping_nested_specs() -> None:

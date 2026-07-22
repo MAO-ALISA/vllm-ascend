@@ -23,13 +23,38 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheSpec,
     MambaSpec,
+    UniformTypeKVCacheSpecs,
 )
+from vllm.v1.request import Request
 
-from vllm_ascend.core.single_type_kv_cache_manager import get_manager_for_kv_cache_spec
+from vllm_ascend.core.block_pool import AscendDSV4BlockPool
+from vllm_ascend.core.single_type_kv_cache_manager import (
+    AscendDSV4SlidingWindowManager,
+    get_manager_for_kv_cache_spec,
+)
 
 USE_MULTI_GROUPS_KV_CACHE = True
 
 _orig_get_kv_cache_coordinator = vllm.v1.core.kv_cache_coordinator.get_kv_cache_coordinator
+
+
+def _representative_kv_cache_spec(
+    kv_cache_spec: KVCacheSpec,
+    is_deepseek_v4_config: bool = False,
+) -> KVCacheSpec:
+    """Unwrap DSV4 uniform groups unsupported by vLLM 0.21."""
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs) and (
+        is_deepseek_v4_config or _is_deepseek_v4_kv_cache_spec(kv_cache_spec)
+    ):
+        specs = list(kv_cache_spec.kv_cache_specs.values())
+        assert specs, "UniformTypeKVCacheSpecs must contain at least one spec"
+        # Some DSV4 state-cache specs have model_version=None. Prefer the
+        # marked attention spec when a uniform group contains both variants.
+        return next(
+            (spec for spec in specs if getattr(spec, "model_version", None) == "deepseek_v4"),
+            specs[0],
+        )
+    return kv_cache_spec
 
 
 def _is_deepseek_v4_kv_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
@@ -80,6 +105,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         self.kv_cache_config = kv_cache_config
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
+        self.is_deepseek_v4 = _is_deepseek_v4_kv_cache_config(kv_cache_config)
         # Fall back to `max_model_len` when unset so the recycling-aware
         # admission cap (vLLM PR #40946) collapses to the prior uncapped
         # behavior. The scheduler always supplies the real value at runtime.
@@ -87,7 +113,8 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             max_num_batched_tokens = max_model_len
         self.max_num_batched_tokens = max_num_batched_tokens
 
-        self.block_pool = BlockPool(
+        block_pool_cls = AscendDSV4BlockPool if self.is_deepseek_v4 else BlockPool
+        self.block_pool = block_pool_cls(
             kv_cache_config.num_blocks,
             enable_caching,
             hash_block_size,
@@ -103,7 +130,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
-                kv_cache_spec=kv_cache_group.kv_cache_spec,
+                kv_cache_spec=_representative_kv_cache_spec(
+                    kv_cache_group.kv_cache_spec,
+                    self.is_deepseek_v4,
+                ),
                 block_pool=self.block_pool,
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
@@ -127,9 +157,17 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             ), "block_size must be divisible by hash_block_size"
         self.verify_and_split_kv_cache_groups()
 
+        for manager in self.single_type_managers:
+            if isinstance(manager, AscendDSV4SlidingWindowManager):
+                manager.scheduler_block_size = self.lcm_block_size
+
         self.use_eagle = use_eagle
 
     def _get_effective_block_size(self, kv_cache_spec: KVCacheSpec) -> int:
+        kv_cache_spec = _representative_kv_cache_spec(
+            kv_cache_spec,
+            getattr(self, "is_deepseek_v4", False),
+        )
         block_size = kv_cache_spec.block_size
         if isinstance(kv_cache_spec, MambaSpec) and self.enable_caching:
             return block_size
@@ -150,7 +188,10 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
 
         for i, g in enumerate(self.kv_cache_config.kv_cache_groups):
             manager_cls = self.single_type_managers[i].__class__
-            spec = g.kv_cache_spec
+            spec = _representative_kv_cache_spec(
+                g.kv_cache_spec,
+                getattr(self, "is_deepseek_v4", False),
+            )
 
             # Try to find an existing group with the same spec
             for existing_spec, group_ids, existing_cls in attention_groups:
@@ -178,6 +219,14 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             if any(gid in self.eagle_group_ids for gid in group_ids)
         }
 
+        # A same-spec group is looked up jointly. If its MTP layer marks one
+        # gid as EAGLE, every sibling must retain the same lookahead block.
+        for manager in self.single_type_managers:
+            manager.use_eagle = False
+        for attention_group_idx in self.eagle_attn_group_indices:
+            for group_id in self.attention_groups[attention_group_idx][1]:
+                self.single_type_managers[group_id].use_eagle = True
+
         # The LCM of the block sizes of all attention types.
         # The cache hit length must be a multiple of the LCM of the block sizes
         # to make sure the cache hit length is a multiple of the block size of
@@ -186,6 +235,20 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # NOTE: use 16k as the alignment tokens for model with compress ratio
         block_sizes = [self._get_effective_block_size(spec) for spec, _, _ in self.attention_groups]
         self.lcm_block_size = lcm(*block_sizes)
+
+    def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
+        if not self.is_deepseek_v4:
+            return super().cache_blocks(request, num_computed_tokens)
+
+        aligned_num_computed_tokens = num_computed_tokens // self.lcm_block_size * self.lcm_block_size
+        for manager in self.single_type_managers:
+            num_tokens_to_cache = aligned_num_computed_tokens
+            if getattr(manager, "use_eagle", False) and aligned_num_computed_tokens > 0:
+                num_tokens_to_cache = min(
+                    num_computed_tokens,
+                    aligned_num_computed_tokens + manager.block_size,
+                )
+            manager.cache_blocks(request, num_tokens_to_cache)
 
     def find_longest_cache_hit(
         self,

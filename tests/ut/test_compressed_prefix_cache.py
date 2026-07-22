@@ -69,9 +69,12 @@ def _make_compress_manager(
     return spec, block_pool, manager
 
 
-def test_compressed_prefix_cache_uses_logical_block_hash() -> None:
-    block_size = 128
-    compress_ratio = 4
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+@pytest.mark.parametrize("compress_ratio", [4, 128], ids=["c4", "c128"])
+def test_compressed_prefix_cache_uses_logical_block_hash(
+    block_size: int,
+    compress_ratio: int,
+) -> None:
     logical_block_size = block_size * compress_ratio
     spec, block_pool, manager = _make_compress_manager(block_size, compress_ratio)
 
@@ -110,9 +113,12 @@ def test_compressed_prefix_cache_uses_logical_block_hash() -> None:
     assert hit_blocks == []
 
 
-def test_compressed_prefix_cache_hits_identical_logical_block() -> None:
-    block_size = 128
-    compress_ratio = 4
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+@pytest.mark.parametrize("compress_ratio", [4, 128], ids=["c4", "c128"])
+def test_compressed_prefix_cache_hits_identical_logical_block(
+    block_size: int,
+    compress_ratio: int,
+) -> None:
     logical_block_size = block_size * compress_ratio
     spec, block_pool, manager = _make_compress_manager(block_size, compress_ratio)
 
@@ -137,16 +143,15 @@ def test_compressed_prefix_cache_hits_identical_logical_block() -> None:
     assert hit_blocks == manager.req_to_blocks[request.request_id]
 
 
-def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
-    block_size = 128
-    compress_ratio = 4
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+@pytest.mark.parametrize("compress_ratio", [4, 128], ids=["c4", "c128"])
+def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit(
+    block_size: int,
+    compress_ratio: int,
+) -> None:
     logical_block_size = block_size * compress_ratio
-    request_a_tokens = list(range(logical_block_size))
-    request_b_tokens = request_a_tokens.copy()
-    request_b_tokens[block_size + 7] = 999_999
-
-    request_a = _make_request("a", request_a_tokens, block_size)
-    request_b = _make_request("b", request_b_tokens, block_size)
+    request_a = _make_request("a", list(range(logical_block_size)), block_size)
+    request_b = _make_request("b", list(range(logical_block_size)), block_size)
     compressed_spec = MLAAttentionSpec(
         block_size=block_size,
         num_kv_heads=1,
@@ -163,7 +168,7 @@ def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
     )
     coordinator = AscendHybridKVCacheCoordinator(
         kv_cache_config=KVCacheConfig(
-            num_blocks=16,
+            num_blocks=compress_ratio + 4,
             kv_cache_tensors=[],
             kv_cache_groups=[
                 KVCacheGroupSpec(["compressed"], compressed_spec),
@@ -190,8 +195,42 @@ def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
 
     hit_blocks, hit_length = coordinator.find_longest_cache_hit(
         request_b.block_hashes,
-        max_cache_hit_length=logical_block_size,
+        max_cache_hit_length=logical_block_size - block_size,
     )
 
     assert hit_length == 0
     assert hit_blocks == ([], [])
+
+
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+@pytest.mark.parametrize("compress_ratio", [4, 128], ids=["c4", "c128"])
+def test_compressed_prefix_cache_replays_after_free(
+    block_size: int,
+    compress_ratio: int,
+) -> None:
+    logical_block_size = block_size * compress_ratio
+    spec, block_pool, manager = _make_compress_manager(block_size, compress_ratio)
+    token_ids = list(range(logical_block_size))
+    prime_request = _make_request("prime", token_ids, block_size)
+    manager.allocate_new_blocks(
+        prime_request.request_id,
+        num_tokens=logical_block_size,
+        num_tokens_main_model=logical_block_size,
+    )
+    manager.cache_blocks(prime_request, num_tokens=logical_block_size)
+    primed_block_id = manager.req_to_blocks[prime_request.request_id][0].block_id
+
+    manager.free(prime_request.request_id)
+
+    replay_request = _make_request("replay", token_ids, block_size)
+    hit_blocks = CompressAttentionManager.find_longest_cache_hit(
+        block_hashes=replay_request.block_hashes,
+        max_length=logical_block_size,
+        kv_cache_group_ids=[0],
+        block_pool=block_pool,
+        kv_cache_spec=spec,
+        use_eagle=False,
+        alignment_tokens=logical_block_size,
+    )[0]
+
+    assert [block.block_id for block in hit_blocks] == [primed_block_id]
