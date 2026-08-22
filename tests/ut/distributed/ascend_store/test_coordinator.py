@@ -99,6 +99,37 @@ class _FakeCompressedManager:
 
 
 class TestAscendStoreCoordinator(unittest.TestCase):
+    def test_512_transfer_uses_common_prefix_across_c128_and_swa(self):
+        block_hashes = _hashes(8)
+        grouped_hashes = get_block_hashes(block_hashes, group_block_size=512, hash_block_size=128)
+        coord = AscendStoreCoordinator(
+            [
+                KVCacheGroupSpec(["layer.c128"], _full_spec(128)),
+                KVCacheGroupSpec(["layer.swa"], _sliding_spec(512, sliding_window=512)),
+            ],
+            scheduler_block_size=512,
+            hash_block_size=128,
+            group_block_sizes=[128, 512],
+            group_cache_families=["c128", "default"],
+            transfer_chunk_tokens=512,
+        )
+        exists = {
+            (0, bytes(grouped_hashes[0])),
+            (0, bytes(grouped_hashes[1])),
+            (1, bytes(grouped_hashes[0])),
+        }
+
+        _, hit_length = coord.find_longest_cache_hit(
+            block_hashes,
+            1024,
+            ExternalCachedBlockPool(128, exists),
+            apply_eagle=False,
+        )
+
+        self.assertEqual(coord.group_transfer_chunk_sizes, [512, 512])
+        self.assertEqual(coord.group_effective_block_sizes, [128 * 128, 512])
+        self.assertEqual(hit_length, 512)
+
     def test_compressed_group_hits_on_effective_granularity(self):
         block_hashes = _hashes(128)
         grouped_hash = get_block_hashes(block_hashes, group_block_size=128 * 128, hash_block_size=128)[0]
@@ -140,7 +171,7 @@ class TestAscendStoreCoordinator(unittest.TestCase):
                 ExternalCachedBlockPool(128, {(0, bytes(grouped_hash))}),
             )
 
-        self.assertEqual(coord.group_effective_specs[0].compress_ratio, 1)
+        self.assertEqual(coord.attention_groups[0][0].compress_ratio, 1)
         self.assertEqual(hit_length, 128 * 128)
 
     def test_missing_required_group_returns_zero(self):
@@ -181,6 +212,25 @@ class TestAscendStoreCoordinator(unittest.TestCase):
             masks = coord.store_mask(512)
 
         self.assertEqual(masks, ([False, False, False, True],))
+
+    def test_store_mask_aggregates_native_blocks_into_transfer_chunk(self):
+        coord = AscendStoreCoordinator(
+            [KVCacheGroupSpec(["layer.0"], _sliding_spec(block_size=128, sliding_window=256))],
+            scheduler_block_size=512,
+            hash_block_size=128,
+            group_block_sizes=[128],
+            group_cache_families=["c1"],
+            transfer_chunk_tokens=512,
+        )
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator._reachable_block_mask",
+            return_value=[True, True, False, True],
+        ):
+            masks = coord.store_mask(512)
+
+        self.assertEqual(coord.group_transfer_chunk_sizes, [512])
+        self.assertEqual(masks, ([False],))
 
     def test_lookup_mask_uses_reachability_without_retention(self):
         coord = AscendStoreCoordinator(

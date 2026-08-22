@@ -38,6 +38,8 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     LayerMultiBlockReqMeta,
     LayerTransferTask,
     ReqMeta,
+    TransferChunkWithBlockId,
+    aggregate_c128_page_chunks,
     block_hash_to_bytes,
     block_hash_to_str,
     get_block_hashes,
@@ -45,6 +47,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     infer_cache_family_ratio,
     infer_group_cache_families,
     infer_tp_mismatch_info,
+    resolve_hybrid_cache_c128_config,
 )
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import (
     AscendStoreCoordinator,
@@ -162,7 +165,23 @@ class KVPoolWorker:
         self.num_kv_cache_groups = len(self.grouped_block_size)
         self.kv_cache_group_families = self._infer_group_families()
         self.group_uses_align_state = self._infer_group_uses_align_state()
-        self.cache_transfer_granularity = self._infer_cache_transfer_granularity()
+        discard_partial_chunks = vllm_config.kv_transfer_config.get_from_extra_config(
+            "discard_partial_chunks", True
+        )
+        self.hybrid_cache_c128_config = resolve_hybrid_cache_c128_config(
+            vllm_config,
+            use_layerwise=self.use_layerwise,
+            group_block_sizes=self.grouped_block_size,
+            group_cache_families=self.kv_cache_group_families,
+            hash_block_size=self.hash_block_size,
+            discard_partial_chunks=discard_partial_chunks,
+        )
+        self.cache_transfer_granularity = (
+            self.hybrid_cache_c128_config.chunk_tokens
+            if self.hybrid_cache_c128_config.enabled
+            else self._infer_cache_transfer_granularity()
+        )
+        assert self.cache_transfer_granularity is not None
         self.h2d_stagger_us = int(extra_config.get("h2d_stagger_us", 0))
         self.layerwise_max_transfer_blocks = int(extra_config.get("layerwise_max_transfer_blocks", 0))
         self.layerwise_max_transfer_bytes = int(extra_config.get("layerwise_max_transfer_bytes", 0))
@@ -286,7 +305,12 @@ class KVPoolWorker:
             )
 
         self.token_database = ChunkedTokenDatabase(
-            self.metadata, self.grouped_block_size, partitions, self.use_hybrid, self.hash_block_size
+            self.metadata,
+            self.grouped_block_size,
+            partitions,
+            self.use_hybrid,
+            self.hash_block_size,
+            self.hybrid_cache_c128_config,
         )
         self.cache_coordinator = self._build_cache_coordinator(vllm_config)
         self.token_database.cache_coordinator = self.cache_coordinator
@@ -535,6 +559,7 @@ class KVPoolWorker:
             hash_block_size=self.hash_block_size,
             group_block_sizes=self.grouped_block_size,
             group_cache_families=self.kv_cache_group_families,
+            transfer_chunk_tokens=self.hybrid_cache_c128_config.chunk_tokens,
             use_eagle=use_eagle,
             retention_interval=retention_interval,
         )
@@ -807,6 +832,174 @@ class KVPoolWorker:
         self.m_store.register_buffer(ptrs, lengths)
         self._start_kv_transfer_threads()
 
+    def _record_sync_load_failures(
+        self,
+        request: ReqMeta,
+        block_ids: list[int],
+        results: list[int] | None,
+    ) -> None:
+        if results is None:
+            results = [1] * len(block_ids)
+        if not any(result != 0 for result in results):
+            return
+        missing_block_ids = record_failed_blocks(block_ids, results)
+        if len(request.block_ids_by_group) == 1:
+            self._invalid_block_ids.update(missing_block_ids)
+        elif missing_block_ids:
+            logger.error(
+                "KV load failed for hybrid request %s. "
+                "Skip invalid-block fallback to avoid scheduler crash. "
+                "failed_blocks=%s",
+                request.req_id,
+                missing_block_ids,
+            )
+
+    def _build_sync_load_group_plan(
+        self,
+        request: ReqMeta,
+        load_group_ids: list[int],
+    ) -> list[tuple[int, list[int], int, bool, bool]]:
+        """Precompute group-level synchronous load state once per request."""
+        load_spec = request.load_spec
+        assert load_spec is not None
+        c128_enabled = self.hybrid_cache_c128_config.enabled
+        c128_mask_num = 0
+        if c128_enabled:
+            chunk_tokens = self.hybrid_cache_c128_config.chunk_tokens
+            assert chunk_tokens is not None
+            c128_mask_num = load_spec.vllm_cached_tokens // chunk_tokens * chunk_tokens
+
+        group_plan: list[tuple[int, list[int], int, bool, bool]] = []
+        for group_id in load_group_ids:
+            if group_id >= len(request.block_ids_by_group):
+                continue
+            block_ids = request.block_ids_by_group[group_id]
+            if c128_enabled:
+                mask_num = c128_mask_num
+            else:
+                group_block_size = self.grouped_block_size[group_id]
+                mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
+            skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
+            is_c128_group = c128_enabled and self.token_database.is_c128_group(group_id)
+            group_plan.append((group_id, block_ids, mask_num, skip_null, is_c128_group))
+        return group_plan
+
+    def _collect_sync_load_chunks(
+        self,
+        request: ReqMeta,
+        token_len: int,
+        load_group_ids: list[int],
+    ) -> tuple[
+        list[str],
+        list[list[int]],
+        list[list[int]],
+        list[int],
+        dict[int, list[TransferChunkWithBlockId]],
+        int,
+    ]:
+        key_list: list[str] = []
+        addr_list: list[list[int]] = []
+        size_list: list[list[int]] = []
+        block_id_list: list[int] = []
+        c128_load_plan: dict[int, list[TransferChunkWithBlockId]] = {}
+        load_masks = self.token_database.load_mask(request.block_hashes, token_len)
+        for group_id, block_ids, mask_num, skip_null, is_c128_group in self._build_sync_load_group_plan(
+            request, load_group_ids
+        ):
+            for chunk in self.token_database.process_transfer_chunks_with_block_ids(
+                token_len,
+                request.block_hashes,
+                block_ids,
+                mask_num,
+                kv_cache_group_id=group_id,
+                skip_null_blocks=skip_null,
+            ):
+                if not self.token_database.mask_allows_chunk(load_masks, group_id, chunk.raw_start):
+                    continue
+                if is_c128_group:
+                    c128_load_plan.setdefault(group_id, []).append(chunk)
+                    continue
+                addr, size, block_id = self.token_database.prepare_transfer_value(
+                    chunk,
+                    block_ids,
+                    kv_cache_group_id=group_id,
+                )
+                if not addr:
+                    continue
+                key_list.append(chunk.key.to_string())
+                addr_list.append(addr)
+                size_list.append(size)
+                block_id_list.append(block_id)
+
+        c128_page_count = sum(
+            len(aggregate_c128_page_chunks(chunks, self.hybrid_cache_c128_config.c128_slots_per_page))
+            for chunks in c128_load_plan.values()
+        )
+        return key_list, addr_list, size_list, block_id_list, c128_load_plan, c128_page_count
+
+    def _load_direct_sync_chunks(
+        self,
+        request: ReqMeta,
+        token_len: int,
+        load_group_ids: list[int],
+        key_list: list[str],
+        addr_list: list[list[int]],
+        size_list: list[list[int]],
+        block_id_list: list[int],
+    ) -> None:
+        rotation = self.tp_rank % len(key_list)
+        key_list_c = _circular_shift(key_list, rotation)
+        addr_list_c = _circular_shift(addr_list, rotation)
+        size_list_c = _circular_shift(size_list, rotation)
+        block_id_list_c = _circular_shift(block_id_list, rotation)
+        logger.debug(
+            "KV pool worker calls backend get request=%s token_len=%d groups=%s keys=%d sample_keys=%s",
+            request.req_id,
+            token_len,
+            load_group_ids,
+            len(key_list_c),
+            key_list_c[:3],
+        )
+        ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        self._record_sync_load_failures(request, block_id_list_c, ret)
+
+    def _load_c128_sync_chunks(
+        self,
+        request: ReqMeta,
+        c128_load_plan: dict[int, list[TransferChunkWithBlockId]],
+    ) -> None:
+        """Load one complete physical C128 page per aggregated page key."""
+        for group_id, chunks in c128_load_plan.items():
+            page_chunks = aggregate_c128_page_chunks(
+                chunks, self.hybrid_cache_c128_config.c128_slots_per_page
+            )
+            key_list: list[str] = []
+            addr_list: list[list[int]] = []
+            size_list: list[list[int]] = []
+            block_id_list: list[int] = []
+            for chunk in page_chunks:
+                block_ids = list(chunk.block_ids) or [chunk.block_id]
+                addr, size, block_id = self.token_database.prepare_transfer_value(
+                    chunk,
+                    block_ids,
+                    kv_cache_group_id=group_id,
+                )
+                if not addr:
+                    continue
+                key_list.append(chunk.key.to_string())
+                addr_list.append(addr)
+                size_list.append(size)
+                block_id_list.append(block_id)
+            if not key_list:
+                continue
+            rotation = self.tp_rank % len(key_list)
+            key_list = _circular_shift(key_list, rotation)
+            addr_list = _circular_shift(addr_list, rotation)
+            size_list = _circular_shift(size_list, rotation)
+            block_id_list = _circular_shift(block_id_list, rotation)
+            ret = self.m_store.get(key_list, addr_list, size_list)
+            self._record_sync_load_failures(request, block_id_list, ret)
+
     def start_load_kv(self, metadata: AscendConnectorMetadata):
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
@@ -852,6 +1045,36 @@ class KVPoolWorker:
             if self.load_async:
                 self.kv_recv_thread.add_request(  # type: ignore[union-attr]
                     request,
+                )
+                continue
+
+            if self.hybrid_cache_c128_config.enabled:
+                (
+                    key_list,
+                    addr_list,
+                    size_list,
+                    block_id_list,
+                    c128_load_plan,
+                    c128_page_count,
+                ) = self._collect_sync_load_chunks(request, token_len, load_group_ids)
+                if key_list:
+                    self._load_direct_sync_chunks(
+                        request,
+                        token_len,
+                        load_group_ids,
+                        key_list,
+                        addr_list,
+                        size_list,
+                        block_id_list,
+                    )
+                if c128_load_plan:
+                    self._load_c128_sync_chunks(request, c128_load_plan)
+                logger.debug(
+                    "KV pool worker backend get returned request=%s token_len=%d groups=%s keys=%d",
+                    request.req_id,
+                    token_len,
+                    load_group_ids,
+                    len(key_list) + c128_page_count,
                 )
                 continue
 
@@ -1873,12 +2096,20 @@ class KVPoolWorker:
                 starts.append(start)
                 ends.append(end)
         else:
-            for start, end, key_string, _ in self.token_database.process_token_key_strings(
-                token_len, block_hashes, kv_cache_group_id=group_id
-            ):
-                keys.append(key_string)
-                starts.append(start)
-                ends.append(end)
+            if self.hybrid_cache_c128_config.enabled:
+                for chunk in self.token_database.process_transfer_chunks(
+                    token_len, block_hashes, kv_cache_group_id=group_id
+                ):
+                    keys.append(chunk.key.to_string())
+                    starts.append(chunk.raw_start)
+                    ends.append(chunk.raw_end)
+            else:
+                for start, end, key_string, _ in self.token_database.process_token_key_strings(
+                    token_len, block_hashes, kv_cache_group_id=group_id
+                ):
+                    keys.append(key_string)
+                    starts.append(start)
+                    ends.append(end)
         return keys, starts, ends
 
     def lookup(
@@ -2012,39 +2243,65 @@ class KVPoolWorker:
             keys: list[str] = []
             chunk_hashes: list[BlockHash | str] = []
             variant_counts: list[int] = []
-            base_block_size = self.token_database.get_block_size(group_id)
-            cache_family = self.token_database.group_cache_families.get("kv", {}).get(group_id, "default")
-            effective_block_size = get_cache_family_granularity(base_block_size, cache_family)
-            if hbm_hit_tokens:
-                grouped_hashes = get_block_hashes(
-                    block_hashes, effective_block_size, self.token_database.hash_block_size
-                )
-                exists.update(
-                    (group_id, block_hash_to_bytes(chunk_hash))
-                    for chunk_hash in grouped_hashes[: hbm_hit_tokens // effective_block_size]
-                )
-            lookup_start = hbm_hit_tokens // effective_block_size * effective_block_size
             lookup_mask = lookup_masks[group_id] if lookup_masks is not None and group_id < len(lookup_masks) else None
+            if self.hybrid_cache_c128_config.enabled:
+                transfer_size = self.cache_coordinator.group_transfer_chunk_sizes[group_id]
+                lookup_start = hbm_hit_tokens // transfer_size * transfer_size
+                for chunk in self.token_database.process_transfer_chunks(
+                    token_len,
+                    block_hashes,
+                    kv_cache_group_id=group_id,
+                ):
+                    chunk_hash = chunk.key.chunk_hash
+                    if chunk.raw_end <= hbm_hit_tokens:
+                        exists.add((group_id, block_hash_to_bytes(chunk_hash)))
+                        continue
+                    if chunk.raw_start < lookup_start:
+                        continue
+                    chunk_idx = chunk.raw_start // transfer_size
+                    if lookup_mask is not None and (
+                        chunk_idx >= len(lookup_mask) or not lookup_mask[chunk_idx]
+                    ):
+                        continue
+                    variants = self._expand_lookup_key_variants(
+                        chunk.key.to_string(), group_id, include_all_ranks
+                    )
+                    keys.extend(variants)
+                    chunk_hashes.append(chunk_hash)
+                    variant_counts.append(len(variants))
+            else:
+                base_block_size = self.token_database.get_block_size(group_id)
+                cache_family = self.token_database.group_cache_families.get("kv", {}).get(group_id, "default")
+                effective_block_size = get_cache_family_granularity(base_block_size, cache_family)
+                if hbm_hit_tokens:
+                    grouped_hashes = get_block_hashes(
+                        block_hashes, effective_block_size, self.token_database.hash_block_size
+                    )
+                    exists.update(
+                        (group_id, block_hash_to_bytes(chunk_hash))
+                        for chunk_hash in grouped_hashes[: hbm_hit_tokens // effective_block_size]
+                    )
+                lookup_start = hbm_hit_tokens // effective_block_size * effective_block_size
 
-            def chunk_filter(
-                start: int,
-                base_block_size=base_block_size,
-                lookup_mask=lookup_mask,
-            ) -> bool:
-                chunk_idx = start // base_block_size
-                return lookup_mask is None or (chunk_idx < len(lookup_mask) and lookup_mask[chunk_idx])
+                def chunk_filter(
+                    start: int,
+                    base_block_size=base_block_size,
+                    lookup_mask=lookup_mask,
+                ) -> bool:
+                    chunk_idx = start // base_block_size
+                    return lookup_mask is None or (chunk_idx < len(lookup_mask) and lookup_mask[chunk_idx])
 
-            for _, _, key_string, chunk_hash in self.token_database.process_token_key_strings(
-                token_len,
-                block_hashes,
-                mask_num=lookup_start,
-                kv_cache_group_id=group_id,
-                chunk_filter=chunk_filter,
-            ):
-                variants = self._expand_lookup_key_variants(key_string, group_id, include_all_ranks)
-                keys.extend(variants)
-                chunk_hashes.append(chunk_hash)
-                variant_counts.append(len(variants))
+                for _, _, key_string, chunk_hash in self.token_database.process_token_key_strings(
+                    token_len,
+                    block_hashes,
+                    mask_num=lookup_start,
+                    kv_cache_group_id=group_id,
+                    chunk_filter=chunk_filter,
+                ):
+                    variants = self._expand_lookup_key_variants(key_string, group_id, include_all_ranks)
+                    keys.extend(variants)
+                    chunk_hashes.append(chunk_hash)
+                    variant_counts.append(len(variants))
 
             if not keys:
                 continue

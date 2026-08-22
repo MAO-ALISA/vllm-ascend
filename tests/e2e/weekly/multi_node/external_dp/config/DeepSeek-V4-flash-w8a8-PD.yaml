@@ -43,6 +43,7 @@ env_common: &env_common
   OMP_NUM_THREADS: "1"
   TASK_QUEUE_ENABLE: "1"
   HCCL_BUFFSIZE: "2560"
+  PYTHONHASHSEED: "0"
 
 templates:
   - node_index: 0
@@ -99,20 +100,40 @@ templates:
       - --additional-config
       - '{"enable_cpu_binding": "True", "enable_shared_expert_dp": true, "enable_dsa_cp": true}'
       - --kv-transfer-config
-      - '{"kv_connector": "MooncakeHybridConnector",
+      - '{"kv_connector": "MultiConnector",
         "kv_role": "kv_producer",
-        "kv_port": "30000",
-        "engine_id": "0",
+        "kv_load_failure_policy": "fail",
         "kv_connector_extra_config": {
-                    "prefill": {
+            "connectors": [
+                {
+                    "kv_connector": "MooncakeHybridConnector",
+                    "kv_role": "kv_producer",
+                    "kv_port": "30000",
+                    "engine_id": "0",
+                    "kv_connector_extra_config": {
+                        "prefill": {
                             "dp_size": 4,
                             "tp_size": 4
-                    },
-                    "decode": {
+                        },
+                        "decode": {
                             "dp_size": 16,
                             "tp_size": 1
+                        }
                     }
-            }
+                },
+                {
+                    "kv_connector": "AscendStoreConnector",
+                    "kv_role": "kv_producer",
+                    "kv_connector_extra_config": {
+                        "lookup_rpc_port": "0",
+                        "backend": "mooncake",
+                        "load_async": false,
+                        "discard_partial_chunks": true,
+                        "hybrid_cache_c128_chunk": true
+                    }
+                }
+            ]
+        }
         }'
 
   - node_index: 1

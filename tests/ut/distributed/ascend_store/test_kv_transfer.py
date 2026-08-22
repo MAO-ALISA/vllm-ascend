@@ -25,6 +25,8 @@ from vllm.distributed.kv_events import BlockStored
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     ChunkedTokenDatabase,
+    HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
+    HybridCacheC128Config,
     KeyMetadata,
     LayerMultiBlockReqMeta,
     LayerPoolKey,
@@ -377,6 +379,58 @@ class TestKVCacheStoreSendingThread(unittest.TestCase):
         t._handle_request(req)
         self.assertEqual(t.request_queue.unfinished_tasks, 0)
         self.assertNotIn("r1", t.stored_requests)
+
+    def test_hybrid_c128_save_writes_512_token_page_snapshots(self):
+        store = FakeStore([0, 0])
+        config = HybridCacheC128Config(
+            enabled=True,
+            chunk_tokens=512,
+            namespace=HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
+            c128_group_id=0,
+            c128_slots_per_page=128,
+        )
+        db = ChunkedTokenDatabase(
+            [KeyMetadata("m", 0, 0, 0, 0)],
+            [128],
+            None,
+            hash_block_size=128,
+            hybrid_cache_c128_config=config,
+        )
+        db.set_group_buffers(
+            {0: [1000]},
+            {0: [1280]},
+            {0: [1280]},
+            group_cache_families={0: "c128"},
+        )
+        thread = KVCacheStoreSendingThread(
+            m_store=store,
+            token_database=db,
+            block_size=128,
+            tp_rank=0,
+            dcp_size=1,
+            put_step=1,
+            kv_role="kv_producer",
+            ready_event=threading.Event(),
+            group_uses_align_state=[False],
+        )
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=1024,
+            block_ids=[7],
+            block_hashes=[f"h{i}" for i in range(8)],
+        )
+        thread.add_stored_request("r1")
+        thread.request_queue.put(request)
+
+        thread._handle_request(request)
+
+        self.assertEqual(len(store.put_calls), 1)
+        keys, addrs, sizes = store.put_calls[0]
+        self.assertEqual(len(keys), 2)
+        self.assertIn("@range:0_4", keys[0])
+        self.assertIn("@range:4_8", keys[1])
+        self.assertEqual(addrs, [[1000 + 7 * 1280], [1000 + 7 * 1280]])
+        self.assertEqual(sizes, [[1280], [1280]])
 
 
 class TestKVCacheStoreRecvingThread(unittest.TestCase):

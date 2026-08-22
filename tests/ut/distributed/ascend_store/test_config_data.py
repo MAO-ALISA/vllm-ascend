@@ -16,12 +16,15 @@
 #
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+    HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
     AscendConnectorMetadata,
     ChunkedTokenDatabase,
+    HybridCacheC128Config,
     KeyMetadata,
     LayerMultiBlockReqMeta,
     LayerPoolKey,
@@ -29,7 +32,10 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import
     PoolKey,
     ReqMeta,
     RequestTracker,
+    TransferChunkWithBlockId,
+    aggregate_c128_page_chunks,
     get_block_hashes,
+    resolve_hybrid_cache_c128_config,
 )
 
 
@@ -81,6 +87,22 @@ class TestPoolKey(unittest.TestCase):
         self.assertNotEqual(pp0_key.to_string(), pp1_key.to_string())
         self.assertIn("@pp_rank:0", pp0_key.to_string())
         self.assertIn("@pp_rank:1", pp1_key.to_string())
+
+    def test_transfer_namespace_and_range_are_part_of_key(self):
+        transfer_meta = KeyMetadata(
+            "llama",
+            1,
+            2,
+            3,
+            0,
+            transfer_namespace=HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
+            slot_start=4,
+            slot_end=8,
+        )
+        key = PoolKey(transfer_meta, "hash1")
+
+        self.assertIn("@transfer:hybrid_c128_chunk_v1@range:4_8@hash1", key.to_string())
+        self.assertNotEqual(hash(key), hash(PoolKey(self.meta, "hash1")))
 
     def test_split_layers(self):
         k = PoolKey(self.meta, "hash1")
@@ -294,6 +316,97 @@ class TestChunkedTokenDatabase(unittest.TestCase):
         self.assertEqual(len(new_keys), 2)
         self.assertIn("@pp_rank:0", new_keys[0])
         self.assertIn("@pp_rank:1", new_keys[1])
+
+    def test_hybrid_c128_transfer_chunks_use_512_token_ranges(self):
+        config = HybridCacheC128Config(
+            enabled=True,
+            chunk_tokens=512,
+            namespace=HYBRID_CACHE_C128_TRANSFER_NAMESPACE,
+            c128_group_id=1,
+            c128_slots_per_page=128,
+        )
+        metadata = [
+            KeyMetadata("hybrid-model", 0, 0, 0, 0, kv_cache_group_id=0),
+            KeyMetadata("hybrid-model", 0, 0, 0, 0, kv_cache_group_id=1),
+        ]
+        db = ChunkedTokenDatabase(
+            metadata,
+            block_size=[128, 128],
+            partitions=None,
+            use_hybrid=True,
+            hash_block_size=128,
+            hybrid_cache_c128_config=config,
+        )
+        db.set_group_buffers(
+            {0: [1000], 1: [2000]},
+            {0: [1280], 1: [1280]},
+            group_cache_families={0: "c4", 1: "c128"},
+        )
+
+        chunks = list(db.process_transfer_chunks(16896, [f"h{i}" for i in range(132)], kv_cache_group_id=1))
+
+        self.assertEqual(len(chunks), 33)
+        self.assertEqual((chunks[0].value_start, chunks[0].value_end), (0, 4))
+        self.assertEqual((chunks[31].value_start, chunks[31].value_end), (124, 128))
+        self.assertEqual((chunks[32].value_start, chunks[32].value_end), (0, 4))
+        self.assertEqual([chunks[31].target_block_index, chunks[32].target_block_index], [0, 1])
+
+    def test_c128_page_aggregation_uses_latest_snapshot_per_page(self):
+        meta = KeyMetadata("hybrid-model", 0, 0, 0, 0)
+        chunks = [
+            TransferChunkWithBlockId(0, 512, 0, 4, 0, PoolKey(meta, "h0"), 10),
+            TransferChunkWithBlockId(512, 1024, 4, 8, 0, PoolKey(meta, "h1"), 10),
+            TransferChunkWithBlockId(16384, 16896, 0, 4, 1, PoolKey(meta, "h2"), 11),
+        ]
+
+        pages = aggregate_c128_page_chunks(chunks, slots_per_page=128)
+
+        self.assertEqual([(page.target_block_index, page.key.chunk_hash) for page in pages], [(1, "h2")])
+
+
+class TestHybridCacheC128Config(unittest.TestCase):
+    @staticmethod
+    def _config(*, enabled=True, backend="mooncake", load_async=False):
+        return SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector_extra_config={
+                    "backend": backend,
+                    "load_async": load_async,
+                    "hybrid_cache_c128_chunk": enabled,
+                }
+            )
+        )
+
+    @staticmethod
+    def _resolve(config, **overrides):
+        kwargs = {
+            "use_layerwise": False,
+            "group_block_sizes": [128, 128],
+            "group_cache_families": ["c4", "c128"],
+            "hash_block_size": 128,
+            "discard_partial_chunks": True,
+        }
+        kwargs.update(overrides)
+        return resolve_hybrid_cache_c128_config(config, **kwargs)
+
+    def test_block_size_128_enables_512_token_chunks(self):
+        resolved = self._resolve(self._config())
+
+        self.assertTrue(resolved.enabled)
+        self.assertEqual(resolved.chunk_tokens, 512)
+        self.assertEqual(resolved.c128_group_id, 1)
+        self.assertEqual(resolved.c128_slots_per_page, 128)
+
+    def test_unsupported_modes_fail_fast(self):
+        cases = (
+            (self._config(backend="memcache"), {}),
+            (self._config(load_async=True), {}),
+            (self._config(), {"use_layerwise": True}),
+            (self._config(), {"discard_partial_chunks": False}),
+        )
+        for config, overrides in cases:
+            with self.subTest(overrides=overrides), self.assertRaises(ValueError):
+                self._resolve(config, **overrides)
 
 
 class TestLoadSpec(unittest.TestCase):

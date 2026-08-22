@@ -21,8 +21,13 @@ from unittest.mock import MagicMock, patch
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
     AscendConnectorMetadata,
+    HybridCacheC128Config,
+    KeyMetadata,
     LoadSpec,
+    PoolKey,
     ReqMeta,
+    TransferChunk,
+    TransferChunkWithBlockId,
 )
 
 
@@ -111,8 +116,15 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker = object.__new__(cls)
         worker.hash_block_size = 128
         worker.num_kv_cache_groups = 1
+        worker.hybrid_cache_c128_config = HybridCacheC128Config(
+            enabled=True,
+            chunk_tokens=128,
+            c128_group_id=0,
+            c128_slots_per_page=128,
+        )
         worker.cache_coordinator = MagicMock()
         worker.cache_coordinator.lcm_block_size = 128
+        worker.cache_coordinator.group_transfer_chunk_sizes = [128]
         worker.cache_coordinator.lookup_mask.return_value = ([True],)
         worker.cache_coordinator.store_mask.return_value = ([False],)
         worker.cache_coordinator.find_longest_cache_hit.return_value = ((), 128)
@@ -120,11 +132,16 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         worker.m_store.exists.return_value = [1]
 
         worker.token_database = MagicMock()
-        worker.token_database.get_block_size.return_value = 128
-        worker.token_database.group_cache_families = {"kv": {0: "default"}}
-        worker.token_database.process_token_key_strings.side_effect = (
-            lambda *args, chunk_filter, **kwargs: [(0, 128, "key", "ab" * 32)] if chunk_filter(0) else []
-        )
+        worker.token_database.process_transfer_chunks.return_value = [
+            TransferChunk(
+                raw_start=0,
+                raw_end=128,
+                value_start=0,
+                value_end=128,
+                target_block_index=0,
+                key=PoolKey(KeyMetadata("model", 0, 0, 0, 0), "ab" * 32),
+            )
+        ]
 
         hit = worker._lookup_with_coordinator(
             128,
@@ -137,10 +154,42 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         self.assertEqual(hit, 128)
         worker.cache_coordinator.lookup_mask.assert_called_once_with(128)
         worker.cache_coordinator.store_mask.assert_not_called()
-        worker.m_store.exists.assert_called_once_with(["key"])
+        worker.m_store.exists.assert_called_once()
+        self.assertIn("ab" * 32, worker.m_store.exists.call_args.args[0][0])
         worker.cache_coordinator.find_longest_cache_hit.assert_called_once()
         self.assertFalse(worker.cache_coordinator.find_longest_cache_hit.call_args.kwargs["apply_eagle"])
-        worker.token_database.process_tokens.assert_not_called()
+        worker.token_database.process_transfer_chunks.assert_called_once()
+
+    def test_c128_sync_load_uses_latest_key_and_target_page(self):
+        cls = self._make_worker_class()
+        worker = object.__new__(cls)
+        worker.tp_rank = 0
+        worker.hybrid_cache_c128_config = HybridCacheC128Config(
+            enabled=True,
+            chunk_tokens=512,
+            c128_group_id=0,
+            c128_slots_per_page=128,
+        )
+        worker.token_database = MagicMock()
+        worker.token_database.prepare_transfer_value.return_value = ([4096], [1024], 7)
+        worker.m_store = MagicMock()
+        worker.m_store.get.return_value = [0]
+        worker._invalid_block_ids = set()
+        request = MagicMock()
+        request.block_ids_by_group = [[7]]
+        meta = KeyMetadata("model", 0, 0, 0, 0)
+        chunks = [
+            TransferChunkWithBlockId(0, 512, 0, 4, 0, PoolKey(meta, "h0"), 7),
+            TransferChunkWithBlockId(512, 1024, 4, 128, 0, PoolKey(meta, "h1"), 7),
+        ]
+
+        worker._load_c128_sync_chunks(request, {0: chunks})
+
+        keys, addrs, sizes = worker.m_store.get.call_args.args
+        self.assertEqual(len(keys), 1)
+        self.assertIn("h1", keys[0])
+        self.assertEqual(addrs, [[4096]])
+        self.assertEqual(sizes, [[1024]])
 
 
 class TestKVPoolWorkerInit(unittest.TestCase):
