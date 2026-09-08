@@ -10,7 +10,7 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Any, NewType, TypeAlias, cast, overload
+from typing import Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
 from vllm.config import VllmConfig
@@ -112,6 +112,14 @@ def init_none_hash(hash_fn: Callable[[Any], bytes]):
         NONE_HASH = BlockHash(os.urandom(32))
     else:
         NONE_HASH = BlockHash(hash_fn(hash_seed))
+
+
+class KVCacheBlockCopy(NamedTuple):
+    """Copy one physical page in every backing tensor of a KV cache group."""
+
+    group_id: int
+    src_block_id: int
+    dst_block_id: int
 
 
 @dataclass(slots=True)

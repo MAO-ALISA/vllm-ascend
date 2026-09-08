@@ -1162,6 +1162,9 @@ class Scheduler(SchedulerInterface):
         self.reset_preempted_req_ids.add(request.request_id)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        scheduler_output.kv_cache_block_copies = (
+            self.kv_cache_manager.take_block_copies()
+        )
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -1501,6 +1504,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
+        self.kv_cache_manager.on_step_completed()
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

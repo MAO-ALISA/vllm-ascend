@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from vllm.multimodal.inputs import MultiModalFeatureSpec
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
     from vllm.v1.request import Request
 else:
     ECConnectorMetadata = object
@@ -239,6 +240,10 @@ class SchedulerOutput:
     # The worker zeros the corresponding GPU memory before the blocks are used,
     # preventing stale NaN/data from corrupting attention or SSM computation.
     new_block_ids_to_zero: list[int] | None = None
+
+    # Execute after zeroing and before forward. Source and destination pages
+    # remain referenced until the scheduler processes this step's output.
+    kv_cache_block_copies: list["KVCacheBlockCopy"] = field(default_factory=list)
 
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.

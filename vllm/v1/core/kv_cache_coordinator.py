@@ -12,6 +12,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHashList,
     BlockHashListWithBlockSize,
     KVCacheBlock,
+    KVCacheBlockCopy,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
     CrossAttentionManager,
@@ -367,6 +368,18 @@ class KVCacheCoordinator(ABC):
         max_cache_hit_length: int,
     ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
         pass
+
+    def take_block_copies(self) -> list[KVCacheBlockCopy]:
+        """Drain copies for this step; their owners retain pages until completion."""
+        return []
+
+    def on_step_completed(self) -> None:
+        """Publish completed cache writes and release retained copy references.
+
+        Coordinators using this hook must enforce synchronous execution or track
+        individual in-flight steps themselves.
+        """
+        return
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""

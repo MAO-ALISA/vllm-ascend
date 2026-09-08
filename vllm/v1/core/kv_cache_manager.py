@@ -11,7 +11,7 @@ from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_coordinator import get_kv_cache_coordinator
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -640,6 +640,12 @@ class KVCacheManager:
         for mgr in self.coordinator.single_type_managers:
             ids.extend(mgr.take_new_block_ids())
         return ids
+
+    def take_block_copies(self) -> list[KVCacheBlockCopy]:
+        return self.coordinator.take_block_copies()
+
+    def on_step_completed(self) -> None:
+        self.coordinator.on_step_completed()
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
