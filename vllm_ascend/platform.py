@@ -33,6 +33,7 @@ os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import init_ascend_config
 
 # isort: off
@@ -783,6 +784,11 @@ class NPUPlatform(Platform):
                 npu_alloc_configs += ",expandable_segments:True"
             os.environ["PYTORCH_NPU_ALLOC_CONF"] = npu_alloc_configs
             logger.info("Set PYTORCH_NPU_ALLOC_CONF=%s", npu_alloc_configs)
+
+        if envs.VLLM_ASCEND_ENABLE_SLOT_APC:
+            from vllm_ascend.core.slot_apc import validate_slot_apc_config
+
+            validate_slot_apc_config(vllm_config)
 
         if ascend_config.enable_mc2_hierarchy_comm and ascend_config.enable_fused_mc2:
             raise ValueError(

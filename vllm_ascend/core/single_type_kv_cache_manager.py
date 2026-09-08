@@ -23,6 +23,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import Request
 
+from vllm_ascend import envs
 from vllm_ascend.utils import vllm_version_is
 
 if TYPE_CHECKING:
@@ -319,6 +320,10 @@ def get_manager_for_kv_cache_spec(
     assert manager_class is not None, f"No KV cache manager registered for {type(kv_cache_spec).__name__}"
     if isinstance(kv_cache_spec, AscendMLAAttentionSpec) and kv_cache_spec.compress_ratio > 1:
         manager_class = CompressAttentionManager
+        if envs.VLLM_ASCEND_ENABLE_SLOT_APC and kv_cache_spec.model_version == "deepseek_v4":
+            from vllm_ascend.core.slot_kv_cache_manager import SlotCompressAttentionManager
+
+            manager_class = SlotCompressAttentionManager
         if max_model_len is not None:
             # Compressed-MLA peak in blocks: ceil(max_model_len/compress/block).
             compress_ratio = kv_cache_spec.compress_ratio

@@ -100,6 +100,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -760,7 +761,13 @@ class NPUModelRunner(GPUModelRunner):
                     req_state.prev_num_draft_len = 0
 
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
-        return super()._update_states(scheduler_output)
+        result = super()._update_states(scheduler_output)
+        copies = getattr(scheduler_output, "kv_cache_block_copies", ())
+        if copies:
+            # Base state update zeros fresh pages. COW must follow zeroing and
+            # precede attention input preparation / graph replay.
+            self._slot_kv_copy_plan.copy_blocks(copies)
+        return result
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -3632,6 +3639,10 @@ class NPUModelRunner(GPUModelRunner):
         """
         # Initialize the memory buffer for KV cache
         kv_cache_raw_tensors = self._allocate_kv_cache_tensors(kv_cache_config)
+        if envs.VLLM_ASCEND_ENABLE_SLOT_APC:
+            from vllm_ascend.worker.slot_kv_cache_copy import SlotKVCacheCopyPlan
+
+            self._slot_kv_copy_plan = SlotKVCacheCopyPlan(kv_cache_config, kv_cache_raw_tensors)
         # Change the memory buffer to the desired shape
         kv_caches = self._reshape_kv_cache_tensors(kv_cache_config, kv_cache_raw_tensors)
 

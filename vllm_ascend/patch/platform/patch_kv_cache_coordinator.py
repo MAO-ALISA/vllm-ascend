@@ -31,6 +31,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.core.single_type_kv_cache_manager import (
     CompressAttentionManager,
     get_manager_for_kv_cache_spec,
@@ -498,7 +499,12 @@ def get_kv_cache_coordinator(
     del pcp_world_size
     token_budget = _select_kv_token_budget(max_model_len, max_in_flight_tokens, max_num_batched_tokens)
     if _is_deepseek_v4_kv_cache_config(kv_cache_config):
-        return AscendHybridKVCacheCoordinator(
+        coordinator_cls = AscendHybridKVCacheCoordinator
+        if envs.VLLM_ASCEND_ENABLE_SLOT_APC:
+            from vllm_ascend.core.slot_kv_cache_coordinator import AscendSlotKVCacheCoordinator
+
+            coordinator_cls = AscendSlotKVCacheCoordinator
+        return coordinator_cls(
             kv_cache_config,
             max_model_len,
             use_eagle,
