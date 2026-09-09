@@ -765,7 +765,9 @@ class NPUModelRunner(GPUModelRunner):
         copies = getattr(scheduler_output, "kv_cache_block_copies", ())
         if copies:
             # Base state update zeros fresh pages. COW must follow zeroing and
-            # precede attention input preparation / graph replay.
+            # precede attention input preparation / graph replay. Keep copies
+            # on the compute stream: previous steps' KV writes precede this
+            # read even when their CPU outputs have not been consumed yet.
             self._slot_kv_copy_plan.copy_blocks(copies)
         return result
 

@@ -103,6 +103,7 @@ class SlotCompressAttentionManager(CompressAttentionManager):
         retention_interval: int | None = None,
         *,
         alignment_tokens: int | None = None,
+        blocks: list[KVCacheBlock] | None = None,
     ) -> None:
         request_id = request.request_id
         num_slots = num_tokens // SLOT_SIZE
@@ -110,9 +111,19 @@ class SlotCompressAttentionManager(CompressAttentionManager):
         if num_slots <= old_slots:
             return
         num_tokens = num_slots * SLOT_SIZE
-        super().cache_blocks(request, num_tokens)
-        blocks = self.req_to_blocks[request_id]
+        if blocks is None:
+            blocks = self.req_to_blocks[request_id]
         span = self.logical_block_size
+        num_full_blocks = num_tokens // span
+        self.block_pool.cache_full_blocks(
+            request=request,
+            blocks=blocks,
+            num_cached_blocks=self.num_cached_block.get(request_id, 0),
+            num_full_blocks=num_full_blocks,
+            block_size=span,
+            kv_cache_group_id=self.kv_cache_group_id,
+        )
+        self.num_cached_block[request_id] = num_full_blocks
         # Full promotion and advancement of the primary partial hash remove old
         # aliases in BlockPool. Re-register every interior boundary of each
         # changed page, longest first, so shorter aliases survive advancement.

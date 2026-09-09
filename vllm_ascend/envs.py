@@ -29,8 +29,8 @@ from typing import Any
 
 env_variables: dict[str, Callable[[], Any]] = {
     # Opt-in DeepSeek V4 local APC at 128 original-token boundaries.
-    # Values: 0 (default), 1. Requires block_size=128, CP=PP=1, synchronous
-    # V1 execution, no KV connector and no speculative decoding. Not sensitive.
+    # Values: 0 (default), 1. Requires block_size=128, CP=PP=1, V1 execution
+    # (sync or async), no KV connector and no speculative decoding. Not sensitive.
     "VLLM_ASCEND_ENABLE_SLOT_APC": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_SLOT_APC", "0"))),
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which

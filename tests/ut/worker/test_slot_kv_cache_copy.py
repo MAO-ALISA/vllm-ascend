@@ -52,13 +52,14 @@ def test_disjoint_views_of_one_storage_are_both_copied():
 
 
 @pytest.mark.parametrize("has_copies", [False, True])
-def test_runner_copies_after_base_zeroing(monkeypatch, has_copies):
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_runner_copies_after_base_zeroing(monkeypatch, has_copies, async_scheduling):
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
     runner = NPUModelRunner.__new__(NPUModelRunner)
-    runner.use_async_scheduling = False
+    runner.use_async_scheduling = async_scheduling
     events = []
     result = object()
 

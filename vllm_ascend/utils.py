@@ -1236,6 +1236,11 @@ def refresh_block_size(vllm_config):
     if not cache_config:
         return
 
+    if envs_ascend.VLLM_ASCEND_ENABLE_SLOT_APC and cache_config.num_gpu_blocks is not None:
+        # EngineCore replaces block_size with the smallest KV group size after
+        # profiling. Handshake revalidation must preserve this runtime value.
+        return
+
     if cache_config.block_size is None:
         cache_config.block_size = 128
 

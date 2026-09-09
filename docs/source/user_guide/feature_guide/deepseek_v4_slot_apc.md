@@ -9,11 +9,12 @@ alias inside one of those pages; it does not change the physical block size.
 
 Use both `feat/dsv4-local-slot-apc-v1` working-tree changes together:
 
-- vLLM: based on the `v0.25.1` tag, with the scheduler copy/completion hooks.
+- vLLM: based on the `v0.25.1` tag, with paired per-step scheduler lifecycle hooks.
 - vLLM Ascend: based on `releases/v0.25.1rc` (`a675940fa`).
 - DeepSeek V4, physical block size 128, prefix caching enabled.
 - DCP=1, PCP=1, PP=1; TP and EP remain available.
-- V1 model runner, synchronous scheduling, no speculative decoding/MTP.
+- V1 model runner, synchronous or asynchronous scheduling.
+- No speculative decoding/MTP or DSpark integration.
 - No KV transfer connector or external KV pool.
 
 The flag is disabled by default. Configurations excluded above fail at startup.
@@ -27,7 +28,7 @@ export VLLM_USE_V2_MODEL_RUNNER=0
 vllm serve /path/to/deepseek-v4 \
   --block-size 128 \
   --enable-prefix-caching \
-  --no-async-scheduling \
+  --async-scheduling \
   --enforce-eager
 ```
 
@@ -36,6 +37,15 @@ Add the model's usual quantization, TP, EP and tokenizer arguments. Omit
 whose generated version differs from the release tag, the existing
 `VLLM_VERSION=0.25.1` Ascend override is appropriate only when the underlying
 vLLM code actually has this version's API and the paired lifecycle changes.
+Use `--no-async-scheduling` for the synchronous baseline. Both repositories
+must include the new `on_step_scheduled` hook and `kv_cache_step_id` field;
+removing the async configuration check from the phase-one code is not sufficient.
+
+The `block_size=128` requirement applies before KV cache initialization. After
+initialization, EngineCore records the smallest KV group block size in
+`cache_config.block_size` (for example, 8 for compressor state). Handshake
+revalidation preserves this runtime value and still checks the other slot-APC
+constraints. The per-group cache managers check the actual physical page sizes.
 
 ## Implementation
 
@@ -60,10 +70,28 @@ copy operations. The NPU worker copies after base state update/zeroing and
 before forward. A copy plan built from the bounded raw allocations includes
 indexer scale bytes and respects storage offsets, padding and shared views.
 
-Cache publication is deferred until the scheduler processes the completed
-model output. This prevents a request from copying pages that another request
-in the same scheduled batch has not written yet. This implementation therefore
-supports one in-flight step only.
+Cache publication is deferred until the scheduler processes the corresponding
+completed model output. The scheduler seals each publication/copy batch with
+an opaque step ID before advancing optimistic request counters. Each snapshot
+records that step's token end position and block table, pinning unpublished
+pages even if a later schedule removes SWA/state blocks from the live table.
+Published full pages do not need extra pins; ordinary decode steps that do not
+advance a slot boundary skip block-table snapshots.
+
+EngineCore consumes outputs in dispatch order. Completion publishes only that
+step's snapshot, capped by finalized input hashes, and then releases that
+step's snapshot/COW references. Async output callbacks do not publish against
+the live, ahead-of-execution request counters. A sampled output token is not
+cached until a later forward has actually computed its KV. Empty steps carry
+no fence; out-of-order or duplicate nonempty fences fail closed.
+
+Free/preemption invalidates the request's publication lifetime without dropping
+dispatched references early. A resumed request receives a new lifetime even
+when it reuses the same Request object or ID. Old completions cannot publish
+into the new block table. Cache reset can return false while cancelled steps
+still hold references; drain those outputs and retry. No device-wide sync or
+separate COW stream is introduced: copies remain ordered with forward on the
+compute stream.
 
 The existing `BlockPool.cache_partial_block()` primitive clears aliases when
 its primary hash advances or becomes a full-page hash. The manager rebuilds
@@ -82,13 +110,20 @@ Run in an environment with both modified packages installed:
   tests/v1/core/test_kv_cache_copy_lifecycle.py
 
 # From vllm-ascend/
-pytest -q tests/ut/core/test_slot_apc.py tests/ut/worker/test_slot_kv_cache_copy.py
+pytest -q tests/ut/core/test_slot_apc.py \
+  tests/ut/core/test_slot_apc_config.py \
+  tests/ut/worker/test_slot_kv_cache_copy.py
 ```
 
 The tests cover exact C4/C128 hits, hash promotion and eviction, independent
 tail representatives, capacity failures, COW reference retention and cleanup,
 deferred publication, hybrid state constraints, chunked prefill recycling,
-disabled-mode compatibility, and bounded raw-page copies.
+disabled-mode compatibility, and bounded raw-page copies. Async tests also
+cover overlapping chunked-prefill snapshots, delayed decode token hashes,
+per-step COW reference release, cancellation and resumed request IDs, empty
+batches, duplicate/out-of-order fences, and reset after draining.
+Configuration tests also cover KV initialization followed by handshake
+revalidation, repeated validation, and preservation of the runtime block size.
 
 To measure CPU lookup and initial alias-publication costs independently of
 NPU execution:
@@ -99,14 +134,36 @@ python benchmarks/benchmark_slot_apc.py --length 131072 --repeats 1000
 
 This microbenchmark is not a model-throughput or COW-device-copy benchmark.
 
+To compare CPU allocation/snapshot/publication overhead with one or more
+in-flight steps (also checks that all retained references are released):
+
+```bash
+VLLM_ASCEND_ENABLE_SLOT_APC=1 python benchmarks/benchmark_slot_apc_async.py \
+  --prefix-length 131072 --steps 1024 --inflight-depth 2
+```
+
+This synthetic benchmark uses known token IDs and no NPU execution. It does
+not measure end-to-end async speedup or replace the device acceptance test.
+
 On four Ascend devices with the test model available:
 
 ```bash
 pytest -q tests/e2e/pull_request/four_card/test_slot_apc.py
 ```
 
-The device test compares cold prefill against warmed prefixes with divergent
-suffixes. It checks exact cached-token counts at 128, 256, 384, 512, 640,
+The device test runs both sync and async scheduling and compares cold prefill
+against four warmed requests with divergent suffixes and different output
+lengths. It checks exact cached-token counts at 128, 256, 384, 512, 640,
 16256, 16384 and 16512 tokens, greedy output equality, and generated-token
 log probabilities. This test must pass on the deployment hardware before
 enabling the feature there. It has not been executed in the Windows workspace.
+
+## Next stages
+
+- Stage 3: MTP and DSpark, including accepted-token boundaries and state rollback.
+- Stage 4: MooncakeHybridConnector only, including transferred slot metadata
+  and coordination with local COW/publication. Other connectors are out of scope.
+- Physical block sizes 32/64: keep the APC match granularity at 128 original
+  tokens, but adapt per-group page coverage, COW boundaries and worker layouts.
+  These are independent parameters, not a change to `SLOT_SIZE`. This change
+  still accepts physical block size 128 only; smaller pages need separate tests.
