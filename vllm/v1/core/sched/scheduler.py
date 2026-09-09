@@ -1165,6 +1165,10 @@ class Scheduler(SchedulerInterface):
         scheduler_output.kv_cache_block_copies = (
             self.kv_cache_manager.take_block_copies()
         )
+        scheduler_output.kv_cache_step_id = self.kv_cache_manager.on_step_scheduled(
+            (self.requests[req_id], self.requests[req_id].num_computed_tokens + count)
+            for req_id, count in scheduler_output.num_scheduled_tokens.items()
+        )
         # Advance the number of computed tokens for the request AFTER
         # the request is scheduled.
         # 1. The scheduler_output of the current step has to include the
@@ -1504,7 +1508,7 @@ class Scheduler(SchedulerInterface):
         scheduler_output: SchedulerOutput,
         model_runner_output: ModelRunnerOutput,
     ) -> dict[int, EngineCoreOutputs]:
-        self.kv_cache_manager.on_step_completed()
+        self.kv_cache_manager.on_step_completed(scheduler_output.kv_cache_step_id)
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict

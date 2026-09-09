@@ -245,6 +245,9 @@ class SchedulerOutput:
     # remain referenced until the scheduler processes this step's output.
     kv_cache_block_copies: list["KVCacheBlockCopy"] = field(default_factory=list)
 
+    # Opaque coordinator fence, paired with this output even for async batches.
+    kv_cache_step_id: int | None = None
+
     # Dynamic speculative decoding: optimal K chosen by scheduler.
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0

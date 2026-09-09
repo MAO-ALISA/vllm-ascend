@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from typing import NamedTuple
 
 from vllm import envs
@@ -373,11 +373,20 @@ class KVCacheCoordinator(ABC):
         """Drain copies for this step; their owners retain pages until completion."""
         return []
 
-    def on_step_completed(self) -> None:
-        """Publish completed cache writes and release retained copy references.
+    def on_step_scheduled(self, requests: Iterable[tuple[Request, int]]) -> int | None:
+        """Seal a step after draining copies, before advancing request counters.
 
-        Coordinators using this hook must enforce synchronous execution or track
-        individual in-flight steps themselves.
+        Each pair contains a request and its end position for THIS step (not
+        necessarily finalized token IDs yet under async scheduling). Return an
+        opaque step ID to pair with completion, or None when unused.
+        """
+        return None
+
+    def on_step_completed(self, step_id: int | None = None) -> None:
+        """Publish this completed step and release its retained references.
+
+        Called before output processing/freeing requests. Later steps can still
+        be in flight; implementations must not use their optimistic counters.
         """
         return
 

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
 
@@ -644,8 +644,11 @@ class KVCacheManager:
     def take_block_copies(self) -> list[KVCacheBlockCopy]:
         return self.coordinator.take_block_copies()
 
-    def on_step_completed(self) -> None:
-        self.coordinator.on_step_completed()
+    def on_step_scheduled(self, requests: Iterable[tuple[Request, int]]) -> int | None:
+        return self.coordinator.on_step_scheduled(requests)
+
+    def on_step_completed(self, step_id: int | None = None) -> None:
+        self.coordinator.on_step_completed(step_id)
 
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
