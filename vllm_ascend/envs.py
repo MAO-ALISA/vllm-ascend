@@ -29,8 +29,9 @@ from typing import Any
 
 env_variables: dict[str, Callable[[], Any]] = {
     # Opt-in DeepSeek V4 local APC at 128 original-token boundaries.
-    # Values: 0 (default), 1. Requires block_size=128, CP=PP=1, V1 execution
-    # (sync or async), no KV connector. MTP/DSpark draft KV must be uncompressed
+    # Values: 0 (default), 1. Requires block_size in (32, 64, 128), CP=PP=1, V1 execution
+    # (sync or async), optionally with MooncakeHybridConnector P/D transfer.
+    # MTP/DSpark draft KV must be uncompressed
     # sliding-window attention; other speculative methods are unsupported. Not sensitive.
     "VLLM_ASCEND_ENABLE_SLOT_APC": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_SLOT_APC", "0"))),
     # max compile thread number for package building. Usually, it is set to

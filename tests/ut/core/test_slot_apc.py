@@ -42,20 +42,20 @@ def slot_env(monkeypatch):
     vllm_version_is.cache_clear()
 
 
-def request(request_id, length, prefix=None):
+def request(request_id, length, prefix=None, *, hash_size=HASH_SIZE):
     tokens = list(range(length)) if prefix is None else prefix
     return Request(
         request_id=request_id,
         prompt_token_ids=tokens,
         sampling_params=SamplingParams(max_tokens=1),
         pooling_params=None,
-        block_hasher=get_request_block_hasher(HASH_SIZE, sha256),
+        block_hasher=get_request_block_hasher(hash_size, sha256),
     )
 
 
-def spec(ratio):
+def spec(ratio, block_size=128):
     return AscendMLAAttentionSpec(
-        block_size=128,
+        block_size=block_size,
         num_kv_heads=1,
         head_size=16,
         dtype=torch.float16,
@@ -64,10 +64,10 @@ def spec(ratio):
     )
 
 
-def manager(ratio, num_blocks=64):
-    pool = BlockPool(num_blocks, True, HASH_SIZE)
+def manager(ratio, num_blocks=64, *, block_size=128):
+    pool = BlockPool(num_blocks, True, block_size // 16)
     mgr = SlotCompressAttentionManager(
-        kv_cache_spec=spec(ratio),
+        kv_cache_spec=spec(ratio, block_size),
         block_pool=pool,
         enable_caching=True,
         kv_cache_group_id=0,
@@ -76,9 +76,9 @@ def manager(ratio, num_blocks=64):
     return mgr, pool
 
 
-@pytest.mark.parametrize("block_size", [32, 64])
+@pytest.mark.parametrize("block_size", [16, 48, 256])
 def test_unsupported_compressed_page_size_rejected(block_size):
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError, match="compressed block_size"):
         SlotCompressAttentionManager(
             kv_cache_spec=replace(spec(4), block_size=block_size),
             block_pool=BlockPool(64, True, HASH_SIZE),
@@ -195,12 +195,14 @@ def test_cow_reserves_capacity_and_releases_refs(cancel_before_dispatch):
     assert pool.get_num_free_blocks() == 3
 
 
-def config(num_blocks=4096, draft_layers=0):
-    specs = [spec(4), spec(128)]
-    for block_size, window in [(128, 128), (8, 8), (32, 128)]:
+def config(num_blocks=4096, draft_layers=0, *, block_size=128, a5=False):
+    specs = [spec(4, block_size), spec(128, block_size)]
+    # Mirror DSV4_BLOCK_SIZES: SWA, C4 state, C128 state. State windows
+    # remain unchanged when the CLI selects smaller physical pages.
+    for size, window in [(block_size, 128), (block_size // 16, 8), (block_size // (8 if a5 else 4), 128)]:
         specs.append(
             AscendSlidingWindowMLASpec(
-                block_size=block_size,
+                block_size=size,
                 sliding_window=window,
                 num_kv_heads=1,
                 head_size=16,
@@ -225,12 +227,12 @@ def config(num_blocks=4096, draft_layers=0):
     )
 
 
-def kv_manager(num_blocks=4096, draft_layers=0):
+def kv_manager(num_blocks=4096, draft_layers=0, *, block_size=128, a5=False):
     return KVCacheManager(
-        kv_cache_config=config(num_blocks, draft_layers),
+        kv_cache_config=config(num_blocks, draft_layers, block_size=block_size, a5=a5),
         max_model_len=32768,
-        hash_block_size=HASH_SIZE,
-        scheduler_block_size=128,
+        hash_block_size=block_size // 16,
+        scheduler_block_size=block_size,
         enable_caching=True,
         use_eagle=bool(draft_layers),
         log_stats=False,
@@ -371,9 +373,11 @@ def test_completed_cache_reuse_does_not_require_full_page_boundary():
 
 
 @pytest.mark.parametrize("inflight_depth", [1, 2, 3])
-def test_chunked_prefill_recycles_state_and_keeps_final_slot(inflight_depth):
-    kv = kv_manager(num_blocks=512)
-    seed = request("seed", 16641)
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_chunked_prefill_recycles_state_and_keeps_final_slot(inflight_depth, block_size):
+    num_blocks = 512 * 128 // block_size
+    kv = kv_manager(num_blocks=num_blocks, block_size=block_size)
+    seed = request("seed", 16641, hash_size=block_size // 16)
     pending = deque()
     while seed.num_computed_tokens < seed.num_tokens:
         kv.new_step_starts()
@@ -386,10 +390,12 @@ def test_chunked_prefill_recycles_state_and_keeps_final_slot(inflight_depth):
     for step in pending:
         kv.on_step_completed(step)
     kv.free(seed)
-    blocks, hit = kv.get_computed_blocks(request("query", 16641))
+    blocks, hit = kv.get_computed_blocks(request("query", 16641, hash_size=block_size // 16))
     assert hit == 16640
-    assert [len(group) for group in blocks.blocks[:2]] == [33, 2]
-    assert kv.block_pool.get_num_free_blocks() == 511
+    assert [len(group) for group in blocks.blocks[:2]] == [
+        (hit + block_size * r - 1) // (block_size * r) for r in (4, 128)
+    ]
+    assert kv.block_pool.get_num_free_blocks() == num_blocks - 1
 
 
 def test_feature_disabled_keeps_existing_coordinator_and_managers(monkeypatch):
@@ -598,7 +604,7 @@ def test_finished_request_does_not_release_later_snapshot_references():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("block_size", 64),
+        ("block_size", 16),
         ("kv_transfer_config", object()),
         ("speculative_config", object()),
         ("pipeline_parallel_size", 2),
@@ -864,9 +870,12 @@ def test_unsupported_draft_layout_fails_closed(invalid_draft):
 
 @pytest.mark.parametrize("draft_layers,num_drafts", [(1, 3), (3, 7)], ids=["mtp", "dspark"])
 @pytest.mark.parametrize("inflight_depth", [1, 2, 3])
-def test_async_speculative_decode_tracks_confirmed_prefix(monkeypatch, draft_layers, num_drafts, inflight_depth):
-    kv = kv_manager(draft_layers=draft_layers)
-    req = request("decode", 127)
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_async_speculative_decode_tracks_confirmed_prefix(
+    monkeypatch, draft_layers, num_drafts, inflight_depth, block_size
+):
+    kv = kv_manager(draft_layers=draft_layers, block_size=block_size)
+    req = request("decode", 127, hash_size=block_size // 16)
     req.status = RequestStatus.RUNNING
     scheduler = AsyncScheduler.__new__(AsyncScheduler)
     scheduler.kv_cache_manager = kv

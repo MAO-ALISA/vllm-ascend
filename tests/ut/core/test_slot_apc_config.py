@@ -45,17 +45,25 @@ def slot_config(monkeypatch):
     vllm_version_is.cache_clear()
 
 
-@pytest.mark.parametrize("block_size", [8, 16, 32, 64, 256])
+@pytest.mark.parametrize("block_size", [8, 16, 48, 256])
 def test_initial_block_size_still_rejected(slot_config, block_size):
     slot_config.cache_config.block_size = block_size
-    with pytest.raises(ValueError, match=rf"block_size=128 \(actual={block_size}\)"):
+    with pytest.raises(ValueError, match=rf"block_size in .*actual={block_size}"):
         validate_slot_apc_config(slot_config)
-    with pytest.raises(ValueError, match="block_size=128"):
+    with pytest.raises(ValueError, match="block_size in"):
         slot_config.__post_init__()
 
 
+@pytest.mark.parametrize("block_size", [None, 32, 64, 128])
+def test_supported_initial_page_sizes_and_default_are_stable(slot_config, block_size):
+    slot_config.cache_config.block_size = block_size
+    for _ in range(3):
+        slot_config.__post_init__()
+        assert slot_config.cache_config.block_size == (128 if block_size is None else block_size)
+
+
 @pytest.mark.parametrize("num_gpu_blocks", [0, 64])
-@pytest.mark.parametrize("runtime_block_size", [8, 16, 32, 128])
+@pytest.mark.parametrize("runtime_block_size", [2, 4, 8, 16, 32, 64, 128])
 def test_revalidation_preserves_initialized_block_size(slot_config, num_gpu_blocks, runtime_block_size):
     slot_config.__post_init__()
     slot_config.cache_config.num_gpu_blocks = num_gpu_blocks
@@ -67,12 +75,18 @@ def test_revalidation_preserves_initialized_block_size(slot_config, num_gpu_bloc
 
 @pytest.mark.parametrize("client_handshake_address", [None, "client"])
 @pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
 def test_handshake_revalidates_after_kv_initialization(
-    slot_config, monkeypatch, client_handshake_address, async_scheduling
+    slot_config, monkeypatch, client_handshake_address, async_scheduling, block_size
 ):
+    slot_config.cache_config.block_size = block_size
     slot_config.scheduler_config.async_scheduling = async_scheduling
     slot_config.__post_init__()
-    groups = [SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=b)) for b in (128, 128, 8, 32)]
+    runtime_size = block_size // 16
+    groups = [
+        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=b))
+        for b in (block_size, block_size, runtime_size, block_size // 4)
+    ]
     kv_config = SimpleNamespace(num_blocks=64, kv_cache_groups=groups)
     executor = Mock()
     executor.get_kv_cache_specs.return_value = [{str(i): g.kv_cache_spec for i, g in enumerate(groups)}]
@@ -94,9 +108,9 @@ def test_handshake_revalidates_after_kv_initialization(
         # block sizes) assignment, with cache planning and device work mocked.
         engine_core.EngineCore._initialize_kv_caches(proc, slot_config)
         assert slot_config.cache_config.num_gpu_blocks == 64
-        assert slot_config.cache_config.block_size == 8
+        assert slot_config.cache_config.block_size == runtime_size
 
-    assert slot_config.cache_config.block_size == 8
+    assert slot_config.cache_config.block_size == runtime_size
     executor.initialize_from_config.assert_called_once_with([kv_config])
     assert proc._perform_handshake.call_count == (1 if client_handshake_address is None else 2)
 
@@ -108,7 +122,7 @@ def test_handshake_revalidates_after_kv_initialization(
         ("parallel_config", "pipeline_parallel_size", 2, "PP=1"),
         ("parallel_config", "decode_context_parallel_size", 2, "DCP=PCP=1"),
         ("parallel_config", "prefill_context_parallel_size", 2, "DCP=PCP=1"),
-        (None, "kv_transfer_config", object(), "no KV connector"),
+        (None, "kv_transfer_config", object(), "MooncakeHybridConnector"),
         (None, "speculative_config", object(), "speculative method mtp or dspark"),
     ],
 )
@@ -158,10 +172,39 @@ def test_probabilistic_dspark_rejected_on_v1(slot_config):
         validate_slot_apc_config(slot_config)
 
 
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize("method", [None, "mtp", "dspark"])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+def test_mooncake_hybrid_config_supported(slot_config, role, method, block_size):
+    slot_config.cache_config.block_size = block_size
+    slot_config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeHybridConnector", kv_role=role)
+    slot_config.scheduler_config.async_scheduling = True
+    slot_config.speculative_config = None if method is None else SimpleNamespace(method=method)
+    validate_slot_apc_config(slot_config)
+
+
+def test_remote_connector_requires_paired_core_hook(slot_config, monkeypatch):
+    slot_config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeHybridConnector", kv_role="kv_consumer")
+    monkeypatch.delattr(KVCacheCoordinator, "on_remote_cache_ready")
+    with pytest.raises(ValueError, match="remote-cache completion hook"):
+        validate_slot_apc_config(slot_config)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("kv_connector", "MultiConnector"), ("kv_role", "kv_both"), ("kv_connector_module_path", "custom.connector")],
+)
+def test_other_remote_modes_rejected(slot_config, field, value):
+    slot_config.kv_transfer_config = SimpleNamespace(kv_connector="MooncakeHybridConnector", kv_role="kv_consumer")
+    setattr(slot_config.kv_transfer_config, field, value)
+    with pytest.raises(ValueError, match="requires"):
+        validate_slot_apc_config(slot_config)
+
+
 def test_clearing_runtime_state_reenables_initial_block_size_validation(slot_config):
     slot_config.cache_config.num_gpu_blocks = 64
     slot_config.cache_config.block_size = 8
     slot_config.__post_init__()
     slot_config.cache_config.num_gpu_blocks = None
-    with pytest.raises(ValueError, match="block_size=128"):
+    with pytest.raises(ValueError, match="block_size in"):
         slot_config.__post_init__()

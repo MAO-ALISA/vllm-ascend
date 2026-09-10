@@ -11,18 +11,21 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 from vllm.v1.request import Request
 
 from vllm_ascend.core.single_type_kv_cache_manager import CompressAttentionManager
-from vllm_ascend.core.slot_apc import SLOT_SIZE
+from vllm_ascend.core.slot_apc import SLOT_SIZE, SUPPORTED_BLOCK_SIZES
 
 
 class SlotCompressAttentionManager(CompressAttentionManager):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.logical_block_size = self.block_size * self.compress_ratio
-        assert self.block_size == SLOT_SIZE and self.compress_ratio in (4, 128)
+        if self.block_size not in SUPPORTED_BLOCK_SIZES or self.compress_ratio not in (4, 128):
+            raise ValueError("Slot APC requires compressed block_size in (32, 64, 128) and compress_ratio in (4, 128)")
+        assert self.logical_block_size % SLOT_SIZE == 0
         assert SLOT_SIZE % self.block_pool.hash_block_size == 0
         self._num_cached_slots: dict[str, int] = {}
         self._partial_hits: dict[str, int] = {}
         self._pending_copies: dict[str, tuple[KVCacheBlock, KVCacheBlock]] = {}
+        self._remote_tails: set[str] = set()
 
     def get_num_blocks_to_allocate(
         self,
@@ -32,6 +35,8 @@ class SlotCompressAttentionManager(CompressAttentionManager):
         total_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        *,
+        num_local_computed_tokens: int | None = None,
     ) -> int:
         count = super().get_num_blocks_to_allocate(
             request_id,
@@ -41,9 +46,9 @@ class SlotCompressAttentionManager(CompressAttentionManager):
             num_tokens_main_model=num_tokens_main_model,
             apply_admission_cap=apply_admission_cap,
         )
-        # Local and total computed lengths coincide: connectors are rejected.
         # Reserve both the hit page (if evictable) and its COW destination.
-        if new_computed_blocks and total_computed_tokens % self.logical_block_size:
+        local_end = total_computed_tokens if num_local_computed_tokens is None else num_local_computed_tokens
+        if new_computed_blocks and local_end % self.logical_block_size:
             count += 1
         return count
 
@@ -54,7 +59,6 @@ class SlotCompressAttentionManager(CompressAttentionManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        assert num_external_computed_tokens == 0
         assert num_local_computed_tokens % SLOT_SIZE == 0
         assert len(new_computed_blocks) == cdiv(num_local_computed_tokens, self.logical_block_size)
         super().add_local_computed_blocks(
@@ -65,16 +69,25 @@ class SlotCompressAttentionManager(CompressAttentionManager):
         self._num_cached_slots[request_id] = num_local_computed_tokens // SLOT_SIZE
         if num_local_computed_tokens % self.logical_block_size:
             self._partial_hits[request_id] = len(new_computed_blocks) - 1
+            if num_external_computed_tokens:
+                self._remote_tails.add(request_id)
 
     def allocate_new_blocks(self, request_id: str, num_tokens: int, num_tokens_main_model: int) -> list[KVCacheBlock]:
         if (index := self._partial_hits.pop(request_id, None)) is not None:
             blocks = self.req_to_blocks[request_id]
             src = blocks[index]
             dst = self.block_pool.get_new_blocks(1)[0]
+            blocks[index] = dst
+            if request_id in self._remote_tails:
+                # The remote manifest supplies the WHOLE page, including the
+                # matching local prefix. Detach it but do not queue a COW that
+                # could overwrite RDMA data in a transfer-only or later step.
+                self._remote_tails.remove(request_id)
+                self.block_pool.free_blocks([src])
+                return super().allocate_new_blocks(request_id, num_tokens, num_tokens_main_model)
             # Transfer the hit reference on src to the copy operation. Keep an
             # extra destination reference too, including if the request aborts.
             self.block_pool.touch([dst])
-            blocks[index] = dst
             self._pending_copies[request_id] = (src, dst)
         return super().allocate_new_blocks(request_id, num_tokens, num_tokens_main_model)
 
@@ -89,6 +102,7 @@ class SlotCompressAttentionManager(CompressAttentionManager):
 
     def pop_blocks_for_free(self, request_id: str) -> list[KVCacheBlock]:
         self._partial_hits.pop(request_id, None)
+        self._remote_tails.discard(request_id)
         self._num_cached_slots.pop(request_id, None)
         if (copy := self._pending_copies.pop(request_id, None)) is not None:
             # The request was cancelled/preempted before schedule output was

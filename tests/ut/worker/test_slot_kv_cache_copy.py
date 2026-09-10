@@ -10,6 +10,31 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm_ascend.worker.slot_kv_cache_copy import SlotKVCacheCopyPlan
 
 
+@pytest.mark.parametrize("block_size", [32, 64, 128])
+@pytest.mark.parametrize("a5", [False, True], ids=["standard", "a5-layout"])
+def test_physical_page_payloads_keep_scales_padding_and_storage_guards(block_size, a5):
+    # V4 indexer row = 128 int8/fp8 bytes + FP16/FP32 scale bytes.
+    # Compressor-state padding follows DSV4_BLOCK_SIZES for each device.
+    widths = [
+        block_size * (640 if a5 else 1024),
+        block_size * (132 if a5 else 130),
+        block_size * (132 if a5 else 130),
+        block_size * (640 if a5 else 1024),
+    ]
+    allocations, raw = {}, {}
+    for gid, width in enumerate(widths):
+        allocations[str(gid)] = (torch.arange(4 * width + 34) % 251).to(torch.uint8)
+        raw[str(gid)] = allocations[str(gid)][17:-17]
+    original = {name: allocation.clone() for name, allocation in allocations.items()}
+    cfg = SimpleNamespace(num_blocks=4, kv_cache_groups=[SimpleNamespace(layer_names=[str(i)]) for i in range(4)])
+    plan = SlotKVCacheCopyPlan(cfg, raw)
+    plan.copy_blocks([KVCacheBlockCopy(gid, 1, 3) for gid in range(4)])
+    for name, allocation in allocations.items():
+        assert torch.equal(raw[name].view(4, -1)[3], original[name][17:-17].view(4, -1)[1])
+        assert torch.equal(allocation[:17], original[name][:17])
+        assert torch.equal(allocation[-17:], original[name][-17:])
+
+
 def test_copy_bounded_pages_including_scales_and_shared_layers():
     # Simulate an aligned view inside a larger allocation, with page padding
     # and indexer scale bytes. The prefix/suffix guards must remain untouched.

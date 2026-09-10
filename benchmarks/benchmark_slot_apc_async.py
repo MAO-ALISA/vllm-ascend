@@ -21,9 +21,10 @@ from vllm_ascend.core.kv_cache_interface import (
     AscendSlidingWindowMLASpec,
     register_ascend_kv_cache_specs,
 )
+from vllm_ascend.core.slot_apc import SUPPORTED_BLOCK_SIZES
 
 
-def run(prefix_length: int, steps: int, inflight_depth: int) -> None:
+def run(prefix_length: int, steps: int, inflight_depth: int, block_size: int = 128) -> None:
     if not envs.VLLM_ASCEND_ENABLE_SLOT_APC:
         raise ValueError("Set VLLM_ASCEND_ENABLE_SLOT_APC=1 with the paired vLLM changes")
     init_none_hash(sha256)
@@ -31,11 +32,11 @@ def run(prefix_length: int, steps: int, inflight_depth: int) -> None:
     total_length = prefix_length + steps
     common = dict(num_kv_heads=1, head_size=16, dtype=torch.float16)
     specs = [
-        AscendMLAAttentionSpec(block_size=128, compress_ratio=ratio, model_version="deepseek_v4", **common)
+        AscendMLAAttentionSpec(block_size=block_size, compress_ratio=ratio, model_version="deepseek_v4", **common)
         for ratio in (4, 128)
     ] + [
         AscendSlidingWindowMLASpec(block_size=size, sliding_window=window, **common)
-        for size, window in ((128, 128), (8, 8), (32, 128))
+        for size, window in ((block_size, 128), (block_size // 16, 8), (block_size // 4, 128))
     ]
     num_blocks = 1 + sum(cdiv(total_length, s.block_size * getattr(s, "compress_ratio", 1)) for s in specs)
     kv = KVCacheManager(
@@ -45,8 +46,8 @@ def run(prefix_length: int, steps: int, inflight_depth: int) -> None:
             kv_cache_groups=[KVCacheGroupSpec(layer_names=[str(i)], kv_cache_spec=s) for i, s in enumerate(specs)],
         ),
         max_model_len=total_length,
-        hash_block_size=8,
-        scheduler_block_size=128,
+        hash_block_size=block_size // 16,
+        scheduler_block_size=block_size,
         enable_caching=True,
         log_stats=False,
     )
@@ -55,7 +56,7 @@ def run(prefix_length: int, steps: int, inflight_depth: int) -> None:
         prompt_token_ids=list(range(total_length)),
         sampling_params=SamplingParams(max_tokens=1),
         pooling_params=None,
-        block_hasher=get_request_block_hasher(8, sha256),
+        block_hasher=get_request_block_hasher(block_size // 16, sha256),
     )
     assert kv.allocate_slots(request, prefix_length) is not None
     assert not kv.take_block_copies()
@@ -81,7 +82,7 @@ def run(prefix_length: int, steps: int, inflight_depth: int) -> None:
     kv.free(request)
     assert kv.block_pool.get_num_free_blocks() == num_blocks - 1
     print(
-        f"prefix={prefix_length} steps={steps} inflight={inflight_depth}: "
+        f"B={block_size} prefix={prefix_length} steps={steps} inflight={inflight_depth}: "
         f"allocate/seal/complete={elapsed * 1e6 / steps:.2f} us/step; "
         f"snapshot_steps={snapshot_steps}; all references released"
     )
@@ -92,7 +93,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefix-length", type=int, default=131072)
     parser.add_argument("--steps", type=int, default=1024)
     parser.add_argument("--inflight-depth", type=int, default=2)
+    parser.add_argument("--block-size", type=int, choices=SUPPORTED_BLOCK_SIZES, default=128)
     args = parser.parse_args()
     if args.prefix_length <= 0 or args.prefix_length % 128 or args.steps <= 0 or args.inflight_depth <= 0:
         parser.error("prefix-length must be a positive multiple of 128; steps and inflight-depth must be positive")
-    run(args.prefix_length, args.steps, args.inflight_depth)
+    run(args.prefix_length, args.steps, args.inflight_depth, args.block_size)

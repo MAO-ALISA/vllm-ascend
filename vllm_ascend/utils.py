@@ -1236,10 +1236,21 @@ def refresh_block_size(vllm_config):
     if not cache_config:
         return
 
-    if envs_ascend.VLLM_ASCEND_ENABLE_SLOT_APC and cache_config.num_gpu_blocks is not None:
-        # EngineCore replaces block_size with the smallest KV group size after
-        # profiling. Handshake revalidation must preserve this runtime value.
-        return
+    if envs_ascend.VLLM_ASCEND_ENABLE_SLOT_APC:
+        if cache_config.num_gpu_blocks is not None:
+            # EngineCore replaces block_size with the smallest KV group size
+            # after profiling. Preserve this runtime value on config reentry.
+            return
+        # Lazy import: slot_apc also uses this module's version helper.
+        from vllm_ascend.core.slot_apc import SUPPORTED_BLOCK_SIZES
+
+        if cache_config.block_size is not None and cache_config.block_size not in SUPPORTED_BLOCK_SIZES:
+            # Do not silently normalize an unsupported explicit slot-APC page
+            # size to 32 through the ordinary DeepSeek V4 fallback below.
+            raise ValueError(
+                f"VLLM_ASCEND_ENABLE_SLOT_APC requires block_size in {SUPPORTED_BLOCK_SIZES} "
+                f"(actual={cache_config.block_size!r})"
+            )
 
     if cache_config.block_size is None:
         cache_config.block_size = 128

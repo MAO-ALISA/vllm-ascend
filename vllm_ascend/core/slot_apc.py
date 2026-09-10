@@ -9,6 +9,7 @@ from vllm.v1.core.kv_cache_coordinator import KVCacheCoordinator
 from vllm_ascend.utils import vllm_version_is
 
 SLOT_SIZE = 128  # Original tokens, independent of the compression ratio.
+SUPPORTED_BLOCK_SIZES = (32, 64, 128)
 
 
 def validate_slot_apc_config(config: VllmConfig) -> None:
@@ -25,15 +26,27 @@ def validate_slot_apc_config(config: VllmConfig) -> None:
     # After KV initialization this field is the minimum across all KV groups,
     # including compressor state, not the selected compressed-page size.
     # The per-group managers validate the actual KVCacheSpec block sizes.
-    if config.cache_config.num_gpu_blocks is None and config.cache_config.block_size != SLOT_SIZE:
-        reasons.append(f"block_size=128 (actual={config.cache_config.block_size!r})")
+    if config.cache_config.num_gpu_blocks is None and config.cache_config.block_size not in SUPPORTED_BLOCK_SIZES:
+        reasons.append(f"block_size in {SUPPORTED_BLOCK_SIZES} (actual={config.cache_config.block_size!r})")
     parallel = config.parallel_config
     if parallel.decode_context_parallel_size != 1 or parallel.prefill_context_parallel_size != 1:
         reasons.append("DCP=PCP=1")
     if parallel.pipeline_parallel_size != 1:
         reasons.append("PP=1")
-    if config.kv_transfer_config is not None:
-        reasons.append("no KV connector")
+    if (transfer := config.kv_transfer_config) is not None:
+        if getattr(transfer, "kv_connector", None) != "MooncakeHybridConnector":
+            reasons.append("MooncakeHybridConnector as the only KV connector")
+        if getattr(transfer, "kv_role", None) not in ("kv_producer", "kv_consumer"):
+            reasons.append("a dedicated kv_producer or kv_consumer")
+        if getattr(transfer, "kv_connector_module_path", None) not in (
+            None,
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector",
+        ):
+            reasons.append("the built-in MooncakeHybridConnector implementation")
+        if not hasattr(KVCacheCoordinator, "on_remote_cache_ready"):
+            reasons.append("the vLLM remote-cache completion hook")
+        if getattr(config.scheduler_config, "disable_hybrid_kv_cache_manager", False):
+            reasons.append("the hybrid KV cache manager")
     if (speculative := config.speculative_config) is not None:
         method = getattr(speculative, "method", None)
         if method not in ("mtp", "dspark"):

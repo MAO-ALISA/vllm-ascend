@@ -51,7 +51,13 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.request import RequestStatus
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
+from vllm_ascend.distributed.kv_transfer.kv_p2p.slot_apc_transfer import (
+    SLOT_TRANSFER_VERSION,
+    SlotTransferLayout,
+    raw_slot_layout,
+)
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.kv_transfer.utils.utils import get_transfer_timeout_value
 from vllm_ascend.utils import enable_custom_op, is_vl_model
@@ -88,6 +94,9 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_lens: list[int]
     ssm_sizes: tuple[int, int]
     local_ip: str = ""
+    slot_apc_version: int = 0
+    slot_apc_layout: str = ""
+    slot_apc_addr_groups: list[list[int]] | None = None
 
 
 @dataclass
@@ -406,6 +415,10 @@ class KVCacheRecvingThread(threading.Thread):
         self.mamba_ssm_size = mamba_ssm_size
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
+        self.slot_apc = ascend_envs.VLLM_ASCEND_ENABLE_SLOT_APC
+        self.slot_layout = SlotTransferLayout(kv_cache_config) if self.slot_apc else None
+        self.remote_num_blocks: dict[tuple[str, int], int] = {}
+        self._slot_transfer_error: str | None = None
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         first_kv_cache = next(iter(self.kv_caches.values()))
@@ -503,6 +516,10 @@ class KVCacheRecvingThread(threading.Thread):
         Returns:
             A set of request IDs that have been completed.
         """
+        if getattr(self, "slot_apc", False):
+            with self.task_tracker.done_task_lock:
+                if self._slot_transfer_error is not None:
+                    raise RuntimeError(self._slot_transfer_error)
         return self.task_tracker.get_and_clear_finished_requests()
 
     def run(self):
@@ -603,12 +620,19 @@ class KVCacheRecvingThread(threading.Thread):
             else:
                 self._transfer_kv_cache_all_groups(req_meta)
             logger.debug("Finished transferring KV cache for request %s.", remote_request_id)
-        except Exception:
+        except Exception as error:
             logger.exception("Failed to transfer KV cache for request %s.", remote_request_id)
+            if getattr(self, "slot_apc", False):
+                # Hybrid invalid-block recovery is not implemented upstream.
+                # Never report a failed or partial RDMA as a successful load.
+                with self.task_tracker.done_task_lock:
+                    self._slot_transfer_error = f"Mooncake slot APC load failed for {request_id}: {error}"
         finally:
             self._send_done_signal_to_free_remote_port(remote_request_id, remote_host, remote_port_send_num)
             if self._mark_request_task_done(request_id, all_task_done):
-                if len(req_meta["local_block_ids"]) > 0:
+                if len(req_meta["local_block_ids"]) > 0 and not (
+                    getattr(self, "slot_apc", False) and self._slot_transfer_error is not None
+                ):
                     self.task_tracker.update_done_task_count(request_id)
                 with self.proc_not_transfer_request_lock:
                     self.proc_not_transfer_request.pop(remote_request_id, None)
@@ -669,6 +693,18 @@ class KVCacheRecvingThread(threading.Thread):
 
         req_start_time = time.perf_counter()
         src_list, dst_list, length_list = [], [], []
+        if getattr(self, "slot_apc", False):
+            if len(remote_block_ids) != self.hma_group_size or len(local_block_ids) != self.hma_group_size:
+                raise ValueError("Mooncake slot APC transfer group count mismatch")
+            with self.remote_metadata_lock:
+                remote_capacity = self.remote_num_blocks[(remote_engine_id, remote_handshake_port)]
+            for remote_ids, local_ids in zip(remote_block_ids, local_block_ids):
+                if len(remote_ids) != len(local_ids):
+                    raise ValueError("Mooncake slot APC requires explicit one-to-one page mappings")
+                if any(type(i) is not int or not 0 < i < remote_capacity for i in remote_ids):
+                    raise ValueError("Mooncake slot APC remote page ID is outside the registered pool")
+                if any(type(i) is not int or not 0 < i < self.kv_cache_config.num_blocks for i in local_ids):
+                    raise ValueError("Mooncake slot APC local page ID is outside the registered pool")
         for i in range(self.hma_group_size):
             if not remote_block_ids[i] or not local_block_ids[i]:
                 continue
@@ -967,9 +1003,22 @@ class KVCacheRecvingThread(threading.Thread):
             assert engine_id != self.local_engine_id, (
                 f"Conflict engine id {engine_id} with local engine id {self.local_engine_id}."
             )
+            if getattr(self, "slot_apc", False):
+                assert self.slot_layout is not None
+                if (
+                    agent_meta.slot_apc_version != SLOT_TRANSFER_VERSION
+                    or agent_meta.slot_apc_layout != self.slot_layout.fingerprint
+                    or agent_meta.slot_apc_addr_groups != self.addr_group_idx
+                    or agent_meta.block_lens != self.block_len_per_addr
+                    or len(agent_meta.kv_caches_base_addr) != len(self.block_len_per_addr)
+                    or agent_meta.num_blocks <= 1
+                ):
+                    raise ValueError("Mooncake slot APC peer raw layouts or protocol versions differ")
             with self.remote_metadata_lock:
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
+                if getattr(self, "slot_apc", False):
+                    self.remote_num_blocks[(engine_id, remote_handshake_port)] = agent_meta.num_blocks
         except Exception:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -1127,6 +1176,11 @@ class MooncakeConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
 
+    def register_slot_kv_caches(self, pages: dict[int, list[torch.Tensor]]) -> None:
+        """Accept bounded raw views from the runner before RDMA registration."""
+        assert self.connector_worker is not None
+        self.connector_worker.slot_pages = pages
+
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
@@ -1181,6 +1235,8 @@ class MooncakeConnectorScheduler:
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self.slot_apc = ascend_envs.VLLM_ASCEND_ENABLE_SLOT_APC
+        self.slot_layout = SlotTransferLayout(kv_cache_config) if self.slot_apc else None
         init_ascend_config(vllm_config)
         self.ascend_config = get_ascend_config()
         self.block_size = vllm_config.cache_config.block_size
@@ -1225,7 +1281,7 @@ class MooncakeConnectorScheduler:
         self.use_compress = hasattr(self.vllm_config.model_config.hf_config, "compress_ratios")
 
         self.kv_cache_specs = []
-        self.need_truncate = self.use_compress
+        self.need_truncate = self.use_compress and not self.slot_apc
         sw_sizes_tokens: list[tuple[int, int]] = []
         self.group_block_size = []
         self.group_compress_ratio = [1 for _ in range(len(kv_cache_config.kv_cache_groups))]
@@ -1352,6 +1408,27 @@ class MooncakeConnectorScheduler:
             params,
         )
 
+        if params is not None and getattr(self, "slot_apc", False):
+            if params.get("do_remote_prefill") and params.get("do_remote_decode"):
+                raise ValueError("Mooncake slot APC does not support bidirectional transfer")
+            if params.get("do_remote_prefill"):
+                assert self.slot_layout is not None
+                end = self.slot_layout.validate(request, params)
+                params["_slot_apc_local_end"] = num_computed_tokens
+                return max(0, end - num_computed_tokens), end > num_computed_tokens
+            if params.get("do_remote_decode") and (
+                request.prompt_token_ids is None
+                or request.sampling_params is None
+                or request.sampling_params.max_tokens != 1
+            ):
+                raise ValueError("Mooncake slot APC producer requests require a token prompt and max_tokens=1")
+            if params.get("do_remote_decode") and request.num_prompt_tokens <= 1:
+                # No remote prefix to send, and no producer ACK to wait for.
+                params["do_remote_decode"] = False
+            return 0, False
+        if params is not None and "slot_apc" in params:
+            raise ValueError("Mooncake slot APC must be enabled on both P and D")
+
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
             token_ids = request.prompt_token_ids or []
@@ -1379,7 +1456,17 @@ class MooncakeConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(p in params for p in ("remote_engine_id", "remote_host", "remote_port", "remote_request_id")):
-                    local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
+                    if getattr(self, "slot_apc", False):
+                        assert self.slot_layout is not None
+                        if num_external_tokens > 0:
+                            local_block_ids, remote_ids = self.slot_layout.load_plan(
+                                request, blocks, params, params["_slot_apc_local_end"]
+                            )
+                        else:
+                            local_block_ids, remote_ids = [], []
+                        params["_slot_apc_recv_ids"] = remote_ids
+                    else:
+                        local_block_ids = blocks.get_unhashed_block_ids_all_groups() if num_external_tokens > 0 else []
                     # Get unhashed blocks to pull from remote.
                     self._reqs_need_recv[request.request_id] = (request, local_block_ids, num_external_tokens)
                 else:
@@ -1398,6 +1485,9 @@ class MooncakeConnectorScheduler:
         # Loop through scheduled reqs and convert to ReqMeta.
         for req_id, (req, block_ids, num_external_tokens) in self._reqs_need_recv.items():
             assert req.kv_transfer_params is not None
+            transfer_params = req.kv_transfer_params
+            if getattr(self, "slot_apc", False):
+                transfer_params = dict(transfer_params, remote_block_ids=transfer_params.pop("_slot_apc_recv_ids"))
             # For the case where there are no remote blocks to pull
             # (block_ids is empty), we don't need to schedule
             # an async read on the worker side.
@@ -1405,7 +1495,7 @@ class MooncakeConnectorScheduler:
                 request_id=req_id,
                 local_block_ids=block_ids,
                 num_external_tokens=num_external_tokens,
-                kv_transfer_params=req.kv_transfer_params,
+                kv_transfer_params=transfer_params,
             )
 
         # Clear the list once workers start the transfers
@@ -1441,8 +1531,15 @@ class MooncakeConnectorScheduler:
 
         # P-side truncation can leave block ids allocated for the original
         # prompt length. Drop those unwritten blocks before SWA tail clipping.
-        computed_block_ids = self._compute_transfer_block_ids(block_ids, request.num_prompt_tokens)
-        computed_block_ids = self.get_sw_clipped_blocks(computed_block_ids)
+        slot_meta = None
+        if getattr(self, "slot_apc", False):
+            assert self.slot_layout is not None
+            if request.num_prompt_tokens <= 1:
+                return False, None
+            computed_block_ids, slot_meta = self.slot_layout.export(request, block_ids)
+        else:
+            computed_block_ids = self._compute_transfer_block_ids(block_ids, request.num_prompt_tokens)
+            computed_block_ids = self.get_sw_clipped_blocks(computed_block_ids)
         computed_block_lens = [len(block_id_list) for block_id_list in computed_block_ids]
         delay_free_blocks = sum(computed_block_lens) > 0
         if delay_free_blocks:
@@ -1451,7 +1548,7 @@ class MooncakeConnectorScheduler:
 
         num_prompt_blocks = math.ceil(request.num_prompt_tokens / self.block_size)
 
-        return delay_free_blocks, dict(
+        transfer_params = dict(
             do_remote_prefill=True,
             do_remote_decode=False,
             remote_block_ids=computed_block_ids,
@@ -1464,6 +1561,9 @@ class MooncakeConnectorScheduler:
             remote_multi_nodes_meta_mapping=self.multi_nodes_meta_mapping,
             num_prompt_blocks=num_prompt_blocks,
         )
+        if slot_meta is not None:
+            transfer_params["slot_apc"] = slot_meta
+        return delay_free_blocks, transfer_params
 
     def set_xfer_handshake_metadata(self, metadata: dict[int, KVConnectorHandshakeMetadata]) -> None:
         """
@@ -1483,6 +1583,9 @@ class MooncakeConnectorWorker:
     """Implementation of Worker side methods"""
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str, kv_cache_config: KVCacheConfig):
+        self.slot_apc = ascend_envs.VLLM_ASCEND_ENABLE_SLOT_APC
+        self.slot_layout = SlotTransferLayout(kv_cache_config) if self.slot_apc else None
+        self.slot_pages: dict[int, list[torch.Tensor]] | None = None
         self._get_prefill_decode_size(vllm_config)
         os.environ["ASCEND_TRANSFER_TIMEOUT"] = str(get_transfer_timeout_value())
         if self._prefill_tp_size < self._decode_tp_size:
@@ -1617,7 +1720,15 @@ class MooncakeConnectorWorker:
         self.addr_group_idx: list[int] = []
         ptrs = []
         lengths = []
-        if not self.use_hybrid:
+        if getattr(self, "slot_apc", False):
+            if self.slot_pages is None or set(self.slot_pages) != set(range(self.hma_group_size)):
+                raise ValueError("Mooncake slot APC requires raw KV registration from the paired model runner")
+            ptrs, lengths, page_bytes, addr_groups = raw_slot_layout(self.slot_pages, self.num_blocks)
+            self.kv_caches_base_addr = ptrs
+            self.block_len_per_addr = page_bytes
+            self.block_stride_per_addr = list(page_bytes)
+            self.addr_group_idx = addr_groups
+        elif not self.use_hybrid:
             for layer_name, kv_cache_tuple in kv_caches.items():
                 if isinstance(kv_cache_tuple, (list, tuple)) is False:
                     kv_cache_tuple = [kv_cache_tuple]
@@ -1696,6 +1807,9 @@ class MooncakeConnectorWorker:
             block_lens=self.block_len_per_addr,
             ssm_sizes=self._mamba_ssm_size,
             local_ip=get_ip(),
+            slot_apc_version=SLOT_TRANSFER_VERSION if self.slot_apc else 0,
+            slot_apc_layout=self.slot_layout.fingerprint if self.slot_layout is not None else "",
+            slot_apc_addr_groups=self.addr_group_idx if self.slot_apc else None,
         )
         self.xfer_handshake_metadata = metadata
 
@@ -1771,6 +1885,14 @@ class MooncakeConnectorWorker:
 
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         """Start loading KV blocks from remote engine."""
+        # Register before enqueue: a fast empty/full-hit transfer can complete
+        # on another thread immediately, including in a no-forward batch.
+        if getattr(self, "slot_apc", False):
+            for req_id in metadata.reqs_in_batch:
+                if self.kv_send_thread is not None:
+                    self.kv_send_thread.task_tracker.add_req_to_process(req_id)
+                if self.kv_recv_thread is not None:
+                    self.kv_recv_thread.task_tracker.add_req_to_process(req_id)
         for req_id, meta in metadata.requests.items():
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
@@ -1833,7 +1955,7 @@ class MooncakeConnectorWorker:
                         all_task_done=(i == tp_num_need_pulls * self._prefill_pp_size - 1),
                     )
 
-        for req_id in metadata.reqs_in_batch:
+        for req_id in () if getattr(self, "slot_apc", False) else metadata.reqs_in_batch:
             if self.kv_send_thread is not None:
                 self.kv_send_thread.task_tracker.add_req_to_process(req_id)
             if self.kv_recv_thread is not None:

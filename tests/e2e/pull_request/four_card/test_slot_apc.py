@@ -10,8 +10,9 @@ from tests.e2e.conftest import VllmRunner, wait_until_npu_memory_free
 
 @pytest.mark.e2e_model("gdydems/DeepSeek-V4-Flash-w4a8-mtp")
 @pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
 @wait_until_npu_memory_free()
-def test_slot_apc_matches_cold_prefill(monkeypatch, async_scheduling):
+def test_slot_apc_matches_cold_prefill(monkeypatch, async_scheduling, block_size):
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_SLOT_APC", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     with VllmRunner(
@@ -23,7 +24,7 @@ def test_slot_apc_matches_cold_prefill(monkeypatch, async_scheduling):
         max_model_len=17408,
         max_num_batched_tokens=1024,
         max_num_seqs=4,
-        block_size=128,
+        block_size=block_size,
         enable_prefix_caching=True,
         async_scheduling=async_scheduling,
         enforce_eager=True,
@@ -33,7 +34,9 @@ def test_slot_apc_matches_cold_prefill(monkeypatch, async_scheduling):
         # Different finish times exercise outstanding decode steps after an
         # earlier request has already freed its scheduler-side block table.
         sampling = [SamplingParams(temperature=0, max_tokens=n, logprobs=5) for n in (1, 8, 17, 33)]
-        for boundary in [128, 256, 384, 512, 640, 16256, 16384, 16512]:
+        boundaries = {128, 256, 384, 512, 640, 16256, 16384, 16512}
+        boundaries.update(block_size * 128 + delta for delta in (-128, 0, 128))
+        for boundary in sorted(boundaries):
             prefix = [10 + i % 97 for i in range(boundary)]
             targets = [{"prompt_token_ids": prefix + [201 + i, 202, 203]} for i in range(4)]
             cold = []
@@ -80,9 +83,10 @@ def test_slot_apc_matches_cold_prefill(monkeypatch, async_scheduling):
     ],
 )
 @pytest.mark.parametrize("async_scheduling", [False, True])
+@pytest.mark.parametrize("block_size", [32, 64, 128])
 @wait_until_npu_memory_free()
 def test_slot_apc_speculative_matches_cold_prefill(
-    monkeypatch, model_name, method, num_speculative_tokens, async_scheduling
+    monkeypatch, model_name, method, num_speculative_tokens, async_scheduling, block_size
 ):
     monkeypatch.setenv("VLLM_ASCEND_ENABLE_SLOT_APC", "1")
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
@@ -95,7 +99,7 @@ def test_slot_apc_speculative_matches_cold_prefill(
         max_model_len=17408,
         max_num_batched_tokens=1024,
         max_num_seqs=4,
-        block_size=128,
+        block_size=block_size,
         enable_prefix_caching=True,
         async_scheduling=async_scheduling,
         enforce_eager=True,
@@ -112,9 +116,10 @@ def test_slot_apc_speculative_matches_cold_prefill(
         # Long decodes cross new slot boundaries after acceptance/rejection;
         # short requests finish with later async work potentially still in flight.
         sampling = [SamplingParams(temperature=0, max_tokens=n, logprobs=5, ignore_eos=True) for n in (1, 8, 129, 257)]
-        for boundary in [128, 384, 512, 16384]:
-            # A draft hit at H needs a valid block through H + 128, as in
-            # upstream EAGLE/MTP. That extra block is checked, NOT reused.
+        for boundary in sorted({128, 384, 512, block_size * 128, 16384}):
+            # A draft hit at H needs a valid physical block through H + B.
+            # Publication remains slot-fenced, so seed one extra 128-token
+            # slot at every B. The peek is checked, NOT reused in the hit.
             prefix = [10 + i % 97 for i in range(boundary + 128)]
             targets = [{"prompt_token_ids": prefix + [201 + i, 202, 203]} for i in range(4)]
             cold = []

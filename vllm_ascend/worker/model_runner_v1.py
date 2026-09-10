@@ -3609,7 +3609,12 @@ class NPUModelRunner(GPUModelRunner):
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
 
         if has_kv_transfer_group():
-            get_kv_transfer_group().register_kv_caches(kv_caches)
+            connector = get_kv_transfer_group()
+            if envs.VLLM_ASCEND_ENABLE_SLOT_APC:
+                # Only the runner owns the bounded raw views; reshaped caches
+                # can omit indexer scales and padding needed by page transfers.
+                connector.register_slot_kv_caches(self._slot_kv_copy_plan.pages)
+            connector.register_kv_caches(kv_caches)
 
         if self.model_config.enable_return_routed_experts:
             self.init_routed_experts_capturer()
