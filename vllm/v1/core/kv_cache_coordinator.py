@@ -390,6 +390,22 @@ class KVCacheCoordinator(ABC):
         """
         return
 
+    def on_request_completed(
+        self, step_id: int | None, request: Request, num_rejected_tokens: int
+    ) -> None:
+        """Observe accepted IDs before free, after this step's rejection update.
+
+        Called between on_step_completed and on_step_processed. The request's
+        computed count may still include later in-flight steps; implementations
+        must use their own snapshot and account for num_rejected_tokens.
+        Aborted requests can be skipped; on_step_processed still drains the step.
+        """
+        return
+
+    def on_step_processed(self, step_id: int | None) -> None:
+        """Release step state after all request outputs (including aborts)."""
+        return
+
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         for manager in self.single_type_managers:

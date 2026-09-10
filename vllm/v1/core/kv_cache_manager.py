@@ -650,6 +650,14 @@ class KVCacheManager:
     def on_step_completed(self, step_id: int | None = None) -> None:
         self.coordinator.on_step_completed(step_id)
 
+    def on_request_completed(
+        self, step_id: int | None, request: Request, num_rejected_tokens: int
+    ) -> None:
+        self.coordinator.on_request_completed(step_id, request, num_rejected_tokens)
+
+    def on_step_processed(self, step_id: int | None) -> None:
+        self.coordinator.on_step_processed(step_id)
+
     def new_step_starts(self) -> None:
         """Called when a new step is started."""
         self.coordinator.new_step_starts()

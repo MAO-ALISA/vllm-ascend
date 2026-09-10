@@ -1591,6 +1591,7 @@ class Scheduler(SchedulerInterface):
             scheduled_spec_token_ids = (
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             )
+            num_rejected = 0
             # Skip a stale frame still pending discard (async_tokens_to_discard
             # > 0): its pre-reset rejection count would underflow the counters.
             if (
@@ -1668,6 +1669,11 @@ class Scheduler(SchedulerInterface):
                     request.status = RequestStatus.FINISHED_ERROR
                     request.resumable = False
                     stopped = True
+
+            if scheduler_output.kv_cache_step_id is not None:
+                self.kv_cache_manager.on_request_completed(
+                    scheduler_output.kv_cache_step_id, request, num_rejected
+                )
 
             routed_experts = None
             if (
@@ -1784,6 +1790,9 @@ class Scheduler(SchedulerInterface):
                         trace_headers=request.trace_headers,
                     )
                 )
+
+        if scheduler_output.kv_cache_step_id is not None:
+            self.kv_cache_manager.on_step_processed(scheduler_output.kv_cache_step_id)
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
