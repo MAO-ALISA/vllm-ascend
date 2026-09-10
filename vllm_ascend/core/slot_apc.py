@@ -14,7 +14,9 @@ SLOT_SIZE = 128  # Original tokens, independent of the compression ratio.
 def validate_slot_apc_config(config: VllmConfig) -> None:
     """Reject configurations whose copy/publication ordering is not supported."""
     reasons = []
-    if not vllm_version_is("0.25.1") or not hasattr(KVCacheCoordinator, "on_step_scheduled"):
+    if not vllm_version_is("0.25.1") or not all(
+        hasattr(KVCacheCoordinator, name) for name in ("on_step_scheduled", "on_request_completed", "on_step_processed")
+    ):
         reasons.append("vLLM 0.25.1 with the local slot-APC lifecycle hooks")
     if config.model_config.hf_text_config.model_type != "deepseek_v4":
         reasons.append("a DeepSeek V4 model")
@@ -32,8 +34,12 @@ def validate_slot_apc_config(config: VllmConfig) -> None:
         reasons.append("PP=1")
     if config.kv_transfer_config is not None:
         reasons.append("no KV connector")
-    if config.speculative_config is not None:
-        reasons.append("no speculative decoding/MTP")
+    if (speculative := config.speculative_config) is not None:
+        method = getattr(speculative, "method", None)
+        if method not in ("mtp", "dspark"):
+            reasons.append("speculative method mtp or dspark")
+        if method == "dspark" and getattr(speculative, "draft_sample_method", "greedy") != "greedy":
+            reasons.append("greedy DSpark draft sampling on the V1 model runner")
     if vllm_envs.VLLM_USE_V2_MODEL_RUNNER:
         reasons.append("the V1 model runner")
     if reasons:

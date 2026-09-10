@@ -11,7 +11,7 @@ from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_manager import KVCacheManager
-from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize, get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -195,7 +195,7 @@ def test_cow_reserves_capacity_and_releases_refs(cancel_before_dispatch):
     assert pool.get_num_free_blocks() == 3
 
 
-def config(num_blocks=4096):
+def config(num_blocks=4096, draft_layers=0):
     specs = [spec(4), spec(128)]
     for block_size, window in [(128, 128), (8, 8), (32, 128)]:
         specs.append(
@@ -207,21 +207,32 @@ def config(num_blocks=4096):
                 dtype=torch.float16,
             )
         )
+    groups = [KVCacheGroupSpec(layer_names=[str(i)], kv_cache_spec=s) for i, s in enumerate(specs)]
+    groups.extend(
+        KVCacheGroupSpec(
+            layer_names=[f"model.mtp.{i}.self_attn"],
+            kv_cache_spec=specs[2],
+            # Match upstream V4: only the LAST layer is annotated. The slot
+            # coordinator must also discover every earlier DSpark draft layer.
+            is_eagle_group=i == draft_layers - 1,
+        )
+        for i in range(draft_layers)
+    )
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=[],
-        kv_cache_groups=[KVCacheGroupSpec(layer_names=[str(i)], kv_cache_spec=s) for i, s in enumerate(specs)],
+        kv_cache_groups=groups,
     )
 
 
-def kv_manager(num_blocks=4096):
+def kv_manager(num_blocks=4096, draft_layers=0):
     return KVCacheManager(
-        kv_cache_config=config(num_blocks),
+        kv_cache_config=config(num_blocks, draft_layers),
         max_model_len=32768,
         hash_block_size=HASH_SIZE,
         scheduler_block_size=128,
         enable_caching=True,
-        use_eagle=False,
+        use_eagle=bool(draft_layers),
         log_stats=False,
     )
 
@@ -618,3 +629,299 @@ def test_unsupported_config_rejected(monkeypatch, field, value):
     )
     with pytest.raises(ValueError, match="VLLM_ASCEND_ENABLE_SLOT_APC requires"):
         validate_slot_apc_config(cfg)
+
+
+def finish_speculative_step(kv, step_id, req=None, rejected=0):
+    kv.on_step_completed(step_id)
+    if req is not None:
+        kv.on_request_completed(step_id, req, rejected)
+    kv.on_step_processed(step_id)
+
+
+@pytest.mark.parametrize("draft_layers", [1, 3], ids=["mtp", "dspark"])
+def test_speculative_groups_publish_after_acceptance_and_keep_draft_peek(draft_layers):
+    kv = kv_manager(draft_layers=draft_layers)
+    coord = kv.coordinator
+    assert coord.eagle_group_ids == set(range(5, 5 + draft_layers))
+    assert [m.use_eagle for m in coord.single_type_managers] == [False] * 5 + [True] * draft_layers
+    for _, ids, _ in coord.attention_groups:
+        assert len({i in coord.eagle_group_ids for i in ids}) == 1
+    seed = request("seed", 640)
+    assert kv.allocate_slots(seed, 640) is not None
+    step, _ = dispatch(kv, (seed, 640))
+    probe = request("probe", 641)
+    kv.on_step_completed(step)
+    assert kv.get_computed_blocks(probe)[1] == 0
+    kv.on_request_completed(step, seed, 0)
+    assert kv.get_computed_blocks(probe)[1] == 512
+    # Target slots are published through 640; only draft KV needs the peek.
+    assert coord.single_type_managers[0]._num_cached_slots["seed"] == 5
+    kv.free(seed)
+    assert not kv.reset_prefix_cache()  # completed output still owns its pins
+    kv.on_step_processed(step)
+    assert kv.get_computed_blocks(probe)[1] == 512
+    assert kv.block_pool.get_num_free_blocks() == kv.block_pool.num_gpu_blocks - 1
+    # Every draft layer participates, not just the last annotated group.
+    blocks, _ = kv.get_computed_blocks(probe)
+    for gid in coord.eagle_group_ids:
+        assert len(blocks.blocks[gid]) == 4
+    first_draft = kv.coordinator.single_type_managers[5]
+    # The original physical table is gone after free; look up the peek by hash.
+    hashes = BlockHashListWithBlockSize(probe.block_hashes, HASH_SIZE, first_draft.block_size)
+    peek_blocks = kv.block_pool.get_cached_block(hashes[4], [5])
+    assert peek_blocks is not None
+    kv.block_pool.evict_blocks({peek_blocks[0].block_id})
+    assert kv.get_computed_blocks(probe)[1] == 384
+
+
+@pytest.mark.parametrize("draft_layers", [1, 3], ids=["mtp", "dspark"])
+@pytest.mark.parametrize("boundary", [128, 512, 16384])
+@pytest.mark.parametrize("rejected,expected_delta", [(0, 0), (1, 0), (3, -128)])
+def test_speculative_rejection_is_subtracted_before_slot_rounding(draft_layers, boundary, rejected, expected_delta):
+    kv = kv_manager(draft_layers=draft_layers)
+    req = request("decode", boundary - 1)
+    assert kv.allocate_slots(req, boundary + 2, num_lookahead_tokens=7) is not None
+    step, _ = dispatch(kv, (req, boundary + 2))
+    kv.on_step_completed(step)
+    # Target verifies three drafts and returns the accepted ones plus a bonus.
+    # The bonus ID is known but its KV has not executed in this step.
+    req.append_output_token_ids(list(range(boundary - 1, boundary + 3 - rejected)))
+    kv.on_request_completed(step, req, rejected)
+    for mgr in kv.coordinator.single_type_managers[:2]:
+        _, hit = mgr.find_slot_cache_hit(
+            req.block_hashes, boundary, [mgr.kv_cache_group_id], kv.block_pool, mgr.kv_cache_spec
+        )
+        assert hit == boundary + expected_delta
+    kv.on_step_processed(step)
+    kv.free(req)
+    assert kv.block_pool.get_num_free_blocks() == kv.block_pool.num_gpu_blocks - 1
+
+
+@pytest.mark.parametrize("draft_layers", [1, 3], ids=["mtp", "dspark"])
+def test_bonus_id_does_not_publish_unexecuted_slot(draft_layers):
+    kv = kv_manager(draft_layers=draft_layers)
+    req = request("decode", 127)
+    kv.allocate_slots(req, 127, num_lookahead_tokens=7)
+    step, _ = dispatch(kv, (req, 127))
+    req.append_output_token_ids(127)
+    finish_speculative_step(kv, step, req)
+    assert len(req.block_hashes) * HASH_SIZE == 128
+    for mgr in kv.coordinator.single_type_managers[:2]:
+        assert mgr._num_cached_slots.get(req.request_id, 0) == 0
+    kv.free(req)
+
+
+@pytest.mark.parametrize("draft_layers", [1, 3], ids=["mtp", "dspark"])
+def test_speculative_inflight_steps_apply_only_rejections_unknown_at_dispatch(draft_layers):
+    kv = kv_manager(draft_layers=draft_layers)
+    req = request("decode", 640)
+    kv.allocate_slots(req, 640)
+    # Known hashes deliberately extend beyond device-confirmed computation.
+    # Hash availability must not hide an overoptimistic publication bug.
+    first, _ = dispatch(kv, (req, 258))
+    second, _ = dispatch(kv, (req, 260))
+    third, _ = dispatch(kv, (req, 262))
+    finish_speculative_step(kv, first, req, rejected=3)  # actual end 255
+    finish_speculative_step(kv, second, req, rejected=2)  # actual end 255
+    assert kv.coordinator.single_type_managers[0]._num_cached_slots["decode"] == 1
+    finish_speculative_step(kv, third, req, rejected=1)  # actual end 256
+    assert kv.coordinator.single_type_managers[0]._num_cached_slots["decode"] == 2
+    # A new snapshot after all results already uses corrected positions.
+    fourth, _ = dispatch(kv, (req, 384))
+    finish_speculative_step(kv, fourth, req)
+    assert kv.coordinator.single_type_managers[0]._num_cached_slots["decode"] == 3
+    kv.free(req)
+    assert not kv.coordinator._pending_steps
+    assert kv.block_pool.get_num_free_blocks() == kv.block_pool.num_gpu_blocks - 1
+
+
+def test_speculative_no_new_slot_still_corrects_later_inflight_steps():
+    kv = kv_manager(draft_layers=3)
+    req = request("decode", 384)
+    kv.allocate_slots(req, 384)
+    step, _ = dispatch(kv, (req, 128))
+    finish_speculative_step(kv, step, req)
+    first, _ = dispatch(kv, (req, 135))
+    snapshot = kv.coordinator._pending_steps[0].snapshots[0]
+    assert first is not None and snapshot.blocks == ()
+    second, _ = dispatch(kv, (req, 258))
+    finish_speculative_step(kv, first, req, rejected=7)
+    finish_speculative_step(kv, second, req)
+    assert kv.coordinator.single_type_managers[0]._num_cached_slots["decode"] == 1
+    kv.free(req)
+
+
+@pytest.mark.parametrize("reuse_request", [False, True])
+def test_speculative_cancel_retains_dispatched_cow_until_processed(reuse_request):
+    kv = kv_manager(draft_layers=3)
+    seed = request("seed", 384)
+    kv.allocate_slots(seed, 384)
+    step, _ = dispatch(kv, (seed, 384))
+    finish_speculative_step(kv, step, seed)
+    kv.free(seed)
+    req = request("decode", 385)
+    blocks, hit = kv.get_computed_blocks(req)
+    assert hit == 256
+    kv.allocate_slots(req, 1, num_new_computed_tokens=hit, new_computed_blocks=blocks)
+    step, copies = dispatch(kv, (req, 257))
+    assert len(copies) == 2
+    kv.free(req)
+    if reuse_request:
+        kv.allocate_slots(req, 385)
+        resumed, _ = dispatch(kv, (req, 385))
+    kv.on_step_completed(step)
+    for copy in copies:
+        assert kv.block_pool.blocks[copy.src_block_id].ref_cnt > 0
+        assert kv.block_pool.blocks[copy.dst_block_id].ref_cnt > 0
+    # Aborted outputs have no per-request callback in Scheduler.
+    kv.on_step_processed(step)
+    if reuse_request:
+        assert kv.coordinator.single_type_managers[0]._num_cached_slots.get("decode", 0) == 0
+        finish_speculative_step(kv, resumed, req)
+        kv.free(req)
+    assert kv.block_pool.get_num_free_blocks() == kv.block_pool.num_gpu_blocks - 1
+
+
+def test_speculative_state_recycling_keeps_rewind_window():
+    kv = kv_manager(draft_layers=3)
+    req = request("decode", 384)
+    kv.allocate_slots(req, 256)
+    step, _ = dispatch(kv, (req, 256))
+    req.num_computed_tokens = 256
+    req.num_output_placeholders = 7
+    state = kv.coordinator.single_type_managers[3]  # block/window = 8
+    rewind_page = state.req_to_blocks["decode"][31]
+    # The device can rewind 264 to 257. Both pages 31 and 32 are needed.
+    req.num_computed_tokens = 264
+    kv.allocate_slots(req, 8)
+    assert state.req_to_blocks["decode"][31] is rewind_page
+    assert not rewind_page.is_null
+    finish_speculative_step(kv, step, req, rejected=7)
+    req.num_output_placeholders = 0
+    kv.coordinator.remove_skipped_blocks("decode", 264)
+    assert state.req_to_blocks["decode"][31].is_null
+    kv.free(req)
+
+
+def test_speculative_completion_order_fails_closed():
+    kv = kv_manager(draft_layers=1)
+    req = request("decode", 256)
+    kv.allocate_slots(req, 256)
+    first, _ = dispatch(kv, (req, 128))
+    second, _ = dispatch(kv, (req, 256))
+    before = [b.ref_cnt for b in kv.block_pool.blocks]
+    with pytest.raises(RuntimeError, match="out-of-order"):
+        kv.on_step_completed(second)
+    kv.on_step_completed(first)
+    with pytest.raises(RuntimeError, match="has not been processed"):
+        kv.on_step_completed(second)
+    with pytest.raises(RuntimeError, match="out-of-order"):
+        kv.on_step_processed(second)
+    assert [b.ref_cnt for b in kv.block_pool.blocks] == before
+    kv.on_request_completed(first, req, 0)
+    kv.on_step_processed(first)
+    finish_speculative_step(kv, second, req)
+    kv.free(req)
+
+
+@pytest.mark.parametrize("draft_layers", [1, 3], ids=["mtp", "dspark"])
+@pytest.mark.parametrize("boundary", [128, 256, 384, 512, 640, 16256, 16384, 16512])
+def test_speculative_exact_joint_hits_need_one_extra_common_block(draft_layers, boundary):
+    kv = kv_manager(draft_layers=draft_layers)
+    prefix = list(range(boundary + 128))
+    seed = request("seed", 0, prefix=prefix + [90001, 90002])
+    assert kv.allocate_slots(seed, seed.num_tokens) is not None
+    step, _ = dispatch(kv, (seed, seed.num_tokens))
+    finish_speculative_step(kv, step, seed)
+    kv.free(seed)
+    probe = request("probe", 0, prefix=prefix + [90003, 90004])
+    assert kv.get_computed_blocks(probe)[1] == boundary
+
+
+@pytest.mark.parametrize("invalid_draft", ["missing", "compressed"])
+def test_unsupported_draft_layout_fails_closed(invalid_draft):
+    cfg = config(draft_layers=1)
+    if invalid_draft == "missing":
+        cfg.kv_cache_groups[-1].is_eagle_group = False
+        cfg.kv_cache_groups[-1].layer_names = ["unknown.0.attention"]
+        reason = "identifiable MTP/DSpark"
+    else:
+        cfg.kv_cache_groups[-1].kv_cache_spec = spec(4)
+        reason = "uncompressed sliding-window"
+    with pytest.raises(ValueError, match=reason):
+        AscendSlotKVCacheCoordinator(
+            kv_cache_config=cfg,
+            max_model_len=32768,
+            use_eagle=True,
+            enable_caching=True,
+            enable_kv_cache_events=False,
+            dcp_world_size=1,
+            pcp_world_size=1,
+            hash_block_size=HASH_SIZE,
+            scheduler_block_size=128,
+        )
+
+
+@pytest.mark.parametrize("draft_layers,num_drafts", [(1, 3), (3, 7)], ids=["mtp", "dspark"])
+@pytest.mark.parametrize("inflight_depth", [1, 2, 3])
+def test_async_speculative_decode_tracks_confirmed_prefix(monkeypatch, draft_layers, num_drafts, inflight_depth):
+    kv = kv_manager(draft_layers=draft_layers)
+    req = request("decode", 127)
+    req.status = RequestStatus.RUNNING
+    scheduler = AsyncScheduler.__new__(AsyncScheduler)
+    scheduler.kv_cache_manager = kv
+    scheduler.requests = {req.request_id: req}
+    scheduler.defer_block_free = False
+    scheduler.enable_return_routed_experts = False
+    scheduler._inflight_prefills = set()
+    scheduler.num_sampled_tokens_per_step = 1
+    scheduler.use_v2_model_runner = False
+
+    def append_output(self, request, token_ids):
+        request.append_output_token_ids(token_ids)
+        return token_ids, False
+
+    monkeypatch.setattr(Scheduler, "_update_request_with_output", append_output)
+    pending = deque()
+
+    def consume():
+        output, drafts, rejected = pending.popleft()
+        kv.on_step_completed(output.kv_cache_step_id)
+        # Apply the real Scheduler update loop's correction before invoking
+        # AsyncScheduler's output handling. The core lifecycle test verifies
+        # the same ordering by executing Scheduler.update_from_output itself.
+        req.num_computed_tokens -= rejected
+        req.num_output_placeholders -= rejected
+        ids = list(range(req.num_tokens, req.num_tokens + drafts - rejected + 1))
+        scheduler._update_request_with_output(req, ids)
+        kv.on_request_completed(output.kv_cache_step_id, req, rejected)
+        kv.on_step_processed(output.kv_cache_step_id)
+        # Despite later in-flight steps, the current result has executed KV
+        # only for all known tokens except its final bonus token.
+        confirmed = (req.num_tokens - 1) // 128
+        for mgr in kv.coordinator.single_type_managers[:2]:
+            assert mgr._num_cached_slots.get(req.request_id, 0) == confirmed
+
+    for index in range(129):
+        drafts = 0 if index == 0 else num_drafts
+        count = 127 if index == 0 else drafts + 1
+        kv.new_step_starts()
+        assert kv.allocate_slots(req, count, num_lookahead_tokens=num_drafts) is not None
+        output = SchedulerOutput.make_empty()
+        output.num_scheduled_tokens = {req.request_id: count}
+        output.total_num_scheduled_tokens = count
+        output.num_spec_tokens_to_schedule = num_drafts
+        if drafts:
+            output.scheduled_spec_decode_tokens = {req.request_id: [-1] * drafts}
+        scheduler._update_after_schedule(output)
+        rejected = (0, drafts, drafts // 2)[index % 3]
+        pending.append((output, drafts, rejected))
+        if len(pending) >= inflight_depth:
+            consume()
+    while pending:
+        consume()
+    assert req.num_output_placeholders == 0
+    assert req.num_computed_tokens == req.num_tokens - 1
+    assert not kv.coordinator._pending_steps
+    kv.free(req)
+    assert kv.block_pool.get_num_free_blocks() == kv.block_pool.num_gpu_blocks - 1

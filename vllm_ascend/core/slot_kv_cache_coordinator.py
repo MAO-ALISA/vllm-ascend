@@ -20,6 +20,7 @@ from vllm_ascend.patch.platform.patch_kv_cache_coordinator import AscendHybridKV
 class _RequestLifetime:
     request: Request
     cancelled: bool = False
+    rejected_tokens: int = 0
 
 
 @dataclass
@@ -27,6 +28,7 @@ class _CacheSnapshot:
     lifetime: _RequestLifetime
     num_tokens: int
     blocks: tuple[list[KVCacheBlock], ...]
+    rejected_tokens_at_schedule: int = 0
 
 
 @dataclass
@@ -39,8 +41,8 @@ class _PendingStep:
 class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if not self.enable_caching or self.dcp_world_size != 1 or self.use_eagle:
-            raise ValueError("Slot APC requires local CP=1 prefix caching without MTP")
+        if not self.enable_caching or self.dcp_world_size != 1:
+            raise ValueError("Slot APC requires local CP=1 prefix caching")
         if SLOT_SIZE % self.hash_block_size:
             raise ValueError("Slot APC requires hash_block_size to divide 128")
         for manager in self.single_type_managers:
@@ -51,10 +53,33 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
             elif not isinstance(manager, SlotCompressAttentionManager):
                 raise ValueError(f"Unsupported slot APC manager: {type(manager).__name__}")
         self.scheduler_block_size = SLOT_SIZE
+        # The upstream V4 annotation only identifies the last draft layer.
+        # DSpark can have several mtp layers, and equal target/draft specs must
+        # not merge: only draft KV requires the next-block validity check.
+        self.eagle_group_ids = {
+            i
+            for i, group in enumerate(self.kv_cache_config.kv_cache_groups)
+            if self.use_eagle and (group.is_eagle_group or any("mtp" in name.split(".") for name in group.layer_names))
+        }
+        if self.use_eagle and not self.eagle_group_ids:
+            raise ValueError("Slot APC requires identifiable MTP/DSpark draft KV groups")
+        for i, manager in enumerate(self.single_type_managers):
+            manager.use_eagle = i in self.eagle_group_ids
+            if manager.use_eagle and not isinstance(manager, SlidingWindowManager):
+                raise ValueError("Slot APC currently requires uncompressed sliding-window MTP/DSpark draft KV")
+        groups = []
+        for spec, group_ids, manager_cls in self.attention_groups:
+            for draft in (False, True):
+                ids = [i for i in group_ids if (i in self.eagle_group_ids) == draft]
+                if ids:
+                    groups.append((spec, ids, manager_cls))
+        self.attention_groups = groups
         self._request_lifetimes: dict[str, _RequestLifetime] = {}
         self._copy_refs: list[KVCacheBlock] = []
         self._pending_steps: deque[_PendingStep] = deque()
         self._next_step_id = 0
+        self._completing_step: _PendingStep | None = None
+        self._completing_snapshots: dict[str, _CacheSnapshot] = {}
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:
@@ -73,14 +98,15 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
                         block_hashes, candidate, group_ids, self.block_pool, spec
                     )
                 else:
+                    draft = group_ids[0] in self.eagle_group_ids
                     hashes = BlockHashListWithBlockSize(block_hashes, self.hash_block_size, spec.block_size)
                     blocks = manager_cls.find_longest_cache_hit(
                         block_hashes=hashes,
-                        max_length=candidate,
+                        max_length=min(candidate + spec.block_size, max_cache_hit_length) if draft else candidate,
                         kv_cache_group_ids=group_ids,
                         block_pool=self.block_pool,
                         kv_cache_spec=spec,
-                        drop_eagle_block=False,
+                        drop_eagle_block=draft,
                         alignment_tokens=SLOT_SIZE,
                         dcp_world_size=1,
                         pcp_world_size=1,
@@ -103,6 +129,16 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
         # callback identifies the block table for a particular execution step.
         # Publication is owned exclusively by the paired step hooks below.
         pass
+
+    def remove_skipped_blocks(
+        self, request_id: str, total_computed_tokens: int, num_prompt_tokens: int | None = None
+    ) -> None:
+        lifetime = self._request_lifetimes.get(request_id)
+        if self.use_eagle and lifetime is not None:
+            # Async scheduling may be ahead of acceptance. Rejected drafts can
+            # rewind the next query into the current SWA/compressor-state page.
+            total_computed_tokens = max(0, total_computed_tokens - lifetime.request.num_output_placeholders)
+        super().remove_skipped_blocks(request_id, total_computed_tokens, num_prompt_tokens)
 
     def take_block_copies(self) -> list[KVCacheBlockCopy]:
         copies = []
@@ -134,6 +170,9 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
             ):
                 # Most decode steps do not cross a slot boundary. Avoid copying
                 # context-sized block tables or pinning pages on those steps.
+                if self.use_eagle:
+                    # Still track rejection offsets for later in-flight steps.
+                    snapshots.append(_CacheSnapshot(lifetime, end_position, (), lifetime.rejected_tokens))
                 continue
             group_blocks = []
             for manager in self.single_type_managers:
@@ -148,7 +187,8 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
                 pinned = [block for block in blocks[start:] if not block.is_null]
                 self.block_pool.touch(pinned)
                 refs.extend(pinned)
-            snapshots.append(_CacheSnapshot(lifetime, aligned, tuple(group_blocks)))
+            # Keep the unrounded end: round only AFTER removing rejected tokens.
+            snapshots.append(_CacheSnapshot(lifetime, end_position, tuple(group_blocks), lifetime.rejected_tokens))
         if not snapshots and not refs:
             return None
         step_id = self._next_step_id
@@ -159,11 +199,20 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
     def on_step_completed(self, step_id: int | None = None) -> None:
         if step_id is None:
             return
+        if self._completing_step is not None:
+            raise RuntimeError("Slot APC previous speculative step has not been processed")
         # EngineCore consumes batch-queue outputs in dispatch order. Fail closed
         # if that contract changes; do not release another step's references.
         if not self._pending_steps or self._pending_steps[0].step_id != step_id:
             raise RuntimeError(f"Slot APC received out-of-order completion for step {step_id}")
         step = self._pending_steps.popleft()
+        if self.use_eagle:
+            # Device completion alone does not establish speculative validity.
+            # Wait for Scheduler to append accepted IDs, then publish before
+            # that request can be freed. Aborts are drained by on_step_processed.
+            self._completing_step = step
+            self._completing_snapshots = {s.lifetime.request.request_id: s for s in step.snapshots}
+            return
         try:
             for snapshot in step.snapshots:
                 if not snapshot.lifetime.cancelled:
@@ -171,12 +220,43 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
         finally:
             self.block_pool.free_blocks(reversed(step.refs))
 
-    def _publish_snapshot(self, snapshot: _CacheSnapshot) -> None:
+    def on_request_completed(self, step_id: int | None, request: Request, num_rejected_tokens: int) -> None:
+        if not self.use_eagle or step_id is None:
+            return
+        if self._completing_step is None or self._completing_step.step_id != step_id:
+            raise RuntimeError(f"Slot APC received request output outside completed step {step_id}")
+        snapshot = self._completing_snapshots.pop(request.request_id, None)
+        if snapshot is None or snapshot.lifetime.cancelled:
+            return
+        lifetime = snapshot.lifetime
+        assert lifetime.request is request
+        assert num_rejected_tokens >= 0
+        lifetime.rejected_tokens += num_rejected_tokens
+        # Later batches may have been dispatched before this or earlier rejects
+        # were known. Subtract ONLY rejects learned since this snapshot was made.
+        end_position = snapshot.num_tokens - (lifetime.rejected_tokens - snapshot.rejected_tokens_at_schedule)
+        self._publish_snapshot(snapshot, max(0, end_position))
+
+    def on_step_processed(self, step_id: int | None) -> None:
+        if not self.use_eagle or step_id is None:
+            return
+        if self._completing_step is None or self._completing_step.step_id != step_id:
+            raise RuntimeError(f"Slot APC received out-of-order processed step {step_id}")
+        step, self._completing_step = self._completing_step, None
+        self._completing_snapshots.clear()
+        self.block_pool.free_blocks(reversed(step.refs))
+
+    def _publish_snapshot(self, snapshot: _CacheSnapshot, end_position: int | None = None) -> None:
+        if not snapshot.blocks:
+            return
         request = snapshot.lifetime.request
-        # Without speculation, input token IDs for this step are known after
-        # processing earlier FIFO outputs. The sampled token of THIS step has
-        # no KV yet. Never use the request's ahead-of-execution computed count.
-        num_tokens = min(snapshot.num_tokens, len(request.block_hashes) * self.hash_block_size)
+        # Only accepted, hashed IDs whose KV has executed may be published. A
+        # sampled bonus token has an ID but no target KV until the next step.
+        # Never use the request's ahead-of-execution computed count.
+        num_tokens = min(
+            snapshot.num_tokens if end_position is None else end_position,
+            len(request.block_hashes) * self.hash_block_size,
+        )
         num_tokens = num_tokens // SLOT_SIZE * SLOT_SIZE
         for manager, blocks in zip(self.single_type_managers, snapshot.blocks):
             if isinstance(manager, SlotCompressAttentionManager):
@@ -191,7 +271,7 @@ class AscendSlotKVCacheCoordinator(AscendHybridKVCacheCoordinator):
                 end_block=end,
                 alignment_tokens=SLOT_SIZE,
                 kv_cache_spec=manager.kv_cache_spec,
-                use_eagle=False,
+                use_eagle=manager.use_eagle,
                 retention_interval=self.retention_interval,
                 num_prompt_tokens=request.num_prompt_tokens,
             )

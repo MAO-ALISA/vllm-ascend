@@ -58,3 +58,84 @@ def test_slot_apc_matches_cold_prefill(monkeypatch, async_scheduling):
                     cold_req.outputs[0].token_ids, cold_req.outputs[0].logprobs, warm_req.outputs[0].logprobs
                 ):
                     assert warm_probs[token].logprob == pytest.approx(cold_probs[token].logprob, abs=0.05)
+
+
+@pytest.mark.parametrize(
+    "model_name,method,num_speculative_tokens",
+    [
+        pytest.param(
+            "gdydems/DeepSeek-V4-Flash-w4a8-mtp",
+            "mtp",
+            3,
+            marks=pytest.mark.e2e_model("gdydems/DeepSeek-V4-Flash-w4a8-mtp"),
+            id="mtp",
+        ),
+        pytest.param(
+            "UploadWeight/DeepSeek-V4-Flash-DSpark-w4a8-test",
+            "dspark",
+            7,
+            marks=pytest.mark.e2e_model("UploadWeight/DeepSeek-V4-Flash-DSpark-w4a8-test"),
+            id="dspark",
+        ),
+    ],
+)
+@pytest.mark.parametrize("async_scheduling", [False, True])
+@wait_until_npu_memory_free()
+def test_slot_apc_speculative_matches_cold_prefill(
+    monkeypatch, model_name, method, num_speculative_tokens, async_scheduling
+):
+    monkeypatch.setenv("VLLM_ASCEND_ENABLE_SLOT_APC", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    with VllmRunner(
+        model_name,
+        tensor_parallel_size=4,
+        enable_expert_parallel=True,
+        quantization="ascend",
+        tokenizer_mode="deepseek_v4",
+        max_model_len=17408,
+        max_num_batched_tokens=1024,
+        max_num_seqs=4,
+        block_size=128,
+        enable_prefix_caching=True,
+        async_scheduling=async_scheduling,
+        enforce_eager=True,
+        disable_log_stats=False,
+        speculative_config={
+            "method": method,
+            "num_speculative_tokens": num_speculative_tokens,
+            "enforce_eager": True,
+            "draft_sample_method": "greedy",
+        },
+        gpu_memory_utilization=0.9,
+    ) as runner:
+        llm = runner.model
+        # Long decodes cross new slot boundaries after acceptance/rejection;
+        # short requests finish with later async work potentially still in flight.
+        sampling = [SamplingParams(temperature=0, max_tokens=n, logprobs=5, ignore_eos=True) for n in (1, 8, 129, 257)]
+        for boundary in [128, 384, 512, 16384]:
+            # A draft hit at H needs a valid block through H + 128, as in
+            # upstream EAGLE/MTP. That extra block is checked, NOT reused.
+            prefix = [10 + i % 97 for i in range(boundary + 128)]
+            targets = [{"prompt_token_ids": prefix + [201 + i, 202, 203]} for i in range(4)]
+            cold = []
+            for target, params in zip(targets, sampling):
+                llm.reset_prefix_cache()
+                result = llm.generate([target], params, use_tqdm=False)[0]
+                assert result.num_cached_tokens == 0
+                cold.append(result)
+            llm.reset_prefix_cache()
+            llm.generate(
+                [{"prompt_token_ids": prefix + [301, 302, 303]}],
+                SamplingParams(temperature=0, max_tokens=1),
+                use_tqdm=False,
+            )
+            warm = llm.generate(targets, sampling, use_tqdm=False)
+            for cold_req, warm_req in zip(cold, warm):
+                assert warm_req.num_cached_tokens == boundary
+                assert cold_req.outputs[0].token_ids == warm_req.outputs[0].token_ids
+                for token, cold_probs, warm_probs in zip(
+                    cold_req.outputs[0].token_ids, cold_req.outputs[0].logprobs, warm_req.outputs[0].logprobs
+                ):
+                    assert warm_probs[token].logprob == pytest.approx(cold_probs[token].logprob, abs=0.05)
+        draft_metrics = [m for m in llm.get_metrics() if m.name == "vllm:spec_decode_num_drafts"]
+        assert draft_metrics and sum(m.value for m in draft_metrics) > 0

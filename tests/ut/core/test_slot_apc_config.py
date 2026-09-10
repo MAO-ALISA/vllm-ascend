@@ -109,7 +109,7 @@ def test_handshake_revalidates_after_kv_initialization(
         ("parallel_config", "decode_context_parallel_size", 2, "DCP=PCP=1"),
         ("parallel_config", "prefill_context_parallel_size", 2, "DCP=PCP=1"),
         (None, "kv_transfer_config", object(), "no KV connector"),
-        (None, "speculative_config", object(), "no speculative decoding/MTP"),
+        (None, "speculative_config", object(), "speculative method mtp or dspark"),
     ],
 )
 def test_initialized_config_still_checks_other_constraints(slot_config, component, field, value, reason):
@@ -129,10 +129,32 @@ def test_disabling_slot_apc_preserves_existing_refresh_behavior(slot_config, mon
     assert slot_config.cache_config.block_size == 32
 
 
-def test_phase_one_core_hooks_are_not_enough_for_async(slot_config, monkeypatch):
+@pytest.mark.parametrize("hook", ["on_step_scheduled", "on_request_completed", "on_step_processed"])
+def test_older_core_hooks_are_not_enough(slot_config, monkeypatch, hook):
     slot_config.scheduler_config.async_scheduling = True
-    monkeypatch.delattr(KVCacheCoordinator, "on_step_scheduled")
+    monkeypatch.delattr(KVCacheCoordinator, hook)
     with pytest.raises(ValueError, match="lifecycle hooks"):
+        validate_slot_apc_config(slot_config)
+
+
+@pytest.mark.parametrize("method", ["mtp", "dspark"])
+@pytest.mark.parametrize("async_scheduling", [False, True])
+def test_speculative_config_supported(slot_config, method, async_scheduling):
+    slot_config.speculative_config = SimpleNamespace(method=method, draft_sample_method="greedy")
+    slot_config.scheduler_config.async_scheduling = async_scheduling
+    slot_config.__post_init__()
+
+
+@pytest.mark.parametrize("method", ["eagle", "dflash", "ngram", None])
+def test_other_speculative_methods_rejected(slot_config, method):
+    slot_config.speculative_config = SimpleNamespace(method=method)
+    with pytest.raises(ValueError, match="speculative method mtp or dspark"):
+        validate_slot_apc_config(slot_config)
+
+
+def test_probabilistic_dspark_rejected_on_v1(slot_config):
+    slot_config.speculative_config = SimpleNamespace(method="dspark", draft_sample_method="probabilistic")
+    with pytest.raises(ValueError, match="greedy DSpark"):
         validate_slot_apc_config(slot_config)
 
 
