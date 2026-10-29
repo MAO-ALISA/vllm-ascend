@@ -199,6 +199,14 @@ For the A3 and A2 PD, pooling and 1M examples, select the hardware-specific
 image tag and container mounts from Section 4. Use the same image on every
 node in a deployment.
 
+For GLM-5.3 Flash with the pooled indexer, the default
+`VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE=builtin` uses the CANN operator packaged
+with vLLM Ascend. Set the variable to `c8` to use the custom INT8 pooled-key
+operator, or `c16` to use its BF16 variant. Install both the matching CANN
+operator package and its Python wheel on every Prefill and Decode node before
+selecting a custom mode. Use the same mode on all nodes. The custom modes do
+not support Prefill context parallelism (PCP).
+
 <a id="glm-common-parameters"></a>
 
 **Common Parameter Descriptions**

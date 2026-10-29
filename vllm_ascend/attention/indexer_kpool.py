@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+from vllm_ascend import envs
 from vllm_ascend.attention.context_parallel.sfa_dcp_utils import get_sfa_pcp_global_metadata
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.core.kv_cache_interface import (
@@ -580,6 +581,11 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         parallel_config = vllm_indexer.vllm_config.parallel_config
         if parallel_config.decode_context_parallel_size > 1:
             raise NotImplementedError("GLM-Next KPool indexing does not support DCP.")
+        self.indexer_mode = envs.VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE
+        if self.indexer_mode not in ("builtin", "c8", "c16"):
+            raise ValueError("VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE must be builtin, c8, or c16.")
+        if self.indexer_mode != "builtin" and parallel_config.prefill_context_parallel_size > 1:
+            raise NotImplementedError("Custom GLM-Next KPool indexing does not support PCP.")
 
         if get_current_hardware_profile().attention_backend_family is AttentionBackendFamily.COMPATIBILITY:
             raise NotImplementedError("KPool sparse attention requires Ascend A2, A3 or A5.")
@@ -596,6 +602,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         self.index_kpool_compress_ape = vllm_indexer.index_kpool_compress_ape
         self.index_kpool_compress_gate = vllm_indexer.index_kpool_compress_gate
         self.k_cache: Any = vllm_indexer.k_cache
+        self.kpool_int8: bool = self.indexer_mode == "c8"
+        self._k_descale_caches: dict[int, torch.Tensor] = {}
         self.tail_cache: Any = vllm_indexer.tail_cache
         self.topk_indices_buffer: torch.Tensor | None = vllm_indexer.topk_indices_buffer
         self._init_cann_ops()
@@ -644,6 +652,21 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
         if not isinstance(cache, torch.Tensor):
             raise TypeError(f"GLM KPool cache {layer.prefix!r} is not bound to a tensor.")
         return cache
+
+    @staticmethod
+    def _symmetric_int8(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        value = x.float()
+        scale = (value.abs().amax(dim=-1) / 127.0).clamp_min(torch.finfo(torch.float16).tiny).to(torch.float16)
+        quantized = (value / scale.unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        return quantized, scale
+
+    def _bound_k_descale_cache(self, cache: torch.Tensor) -> torch.Tensor:
+        virtual_engine = getattr(get_forward_context(), "virtual_engine", 0) or 0
+        scales = self._k_descale_caches.get(virtual_engine)
+        if scales is None or scales.shape != cache.shape[:-1] or scales.device != cache.device:
+            scales = torch.ones(cache.shape[:-1], dtype=torch.float16, device=cache.device)
+            self._k_descale_caches[virtual_engine] = scales
+        return scales
 
     def forward(
         self,
@@ -714,10 +737,14 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             self._prepare_keypool_state = adapters.prepare_keypool_state
             self._write_keypool_caches = fused.write_keypool_caches
             self._key_pool = torch.ops.cann_ops_transformer.key_pool
-            self._pool_key_indexer = partial(
-                adapters.pool_key_indexer_nonempty,
-                torch.ops.cann_ops_transformer.pool_key_indexer,
-            )
+            if self.indexer_mode == "builtin":
+                self._pool_key_indexer = partial(
+                    adapters.pool_key_indexer_nonempty,
+                    torch.ops.cann_ops_transformer.pool_key_indexer,
+                )
+            else:
+                pki_ops = import_module("cann_ops_transformer_pool_key_indexer")
+                self._pool_key_indexer = pki_ops.pool_key_indexer
         except (ImportError, AttributeError) as exc:
             raise RuntimeError(
                 "GLM-5.3-Flash KPool requires cann_ops_transformer with key_pool and pool_key_indexer, "
@@ -768,8 +795,9 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             or tail_metadata.cann_inputs is None
         ):
             raise ValueError("GLM KPool metadata requires CANN request boundaries and pooled-key row indices.")
-        if indexer_cache.dtype != torch.bfloat16:
-            raise TypeError("GLM KPool compressed cache must be bfloat16.")
+        expected_cache_dtype = torch.int8 if self.kpool_int8 else torch.bfloat16
+        if indexer_cache.dtype != expected_cache_dtype:
+            raise TypeError(f"GLM KPool compressed cache must be {expected_cache_dtype}.")
         if tail_cache.dtype != torch.float32:
             raise TypeError("GLM KPool compressor tail must be float32.")
         if tail_cache.ndim != 3 or tail_cache.shape[1] < self.index_kpool or tail_cache.shape[2] != 2 * self.head_dim:
@@ -803,6 +831,11 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             cmp_ratio=self.index_kpool,
             norm_eps=norm_eps,
         )
+        k_descale_cache = self._bound_k_descale_cache(indexer_cache) if self.kpool_int8 else None
+        if self.kpool_int8:
+            pooled_key, pooled_scales = self._symmetric_int8(pooled_key)
+        else:
+            pooled_scales = None
         tail_key = tail_gate = None
         if tail_metadata.cann_inputs.retained_indices is not None:
             # Re-project the live MTP rollback window missing from CANN state.
@@ -822,6 +855,8 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
             cache_metadata,
             tail_metadata,
             state,
+            k_descale_cache=k_descale_cache,
+            pooled_scales=pooled_scales,
         )
         # Sharing top-k still advances the compressed cache and raw tail.
         if not compute_topk:
@@ -837,21 +872,64 @@ class Glm5NextKPoolIndexerBackend(nn.Module):
                 return output[:, :output_width].unsqueeze(1)
             return torch.full((num_tokens, 1, output_width), -1, dtype=torch.int32, device=hidden_states.device)
         assert q_values is not None and weights is not None
-        query = q_values.to(indexer_cache.dtype)
+        if self.indexer_mode == "builtin":
+            indices, _ = self._pool_key_indexer(
+                q_values.to(indexer_cache.dtype),
+                indexer_cache,
+                weights.to(torch.bfloat16),
+                query_metadata.pool_tail,
+                actual_seq_q=query_metadata.cum_query_lens,
+                actual_seq_k=query_metadata.seq_lens,
+                block_table=indexer_metadata.block_table,
+                layout_q="TND",
+                layout_k="PA_BBND",
+                topk=self.topk_tokens,
+                pool_size=self.index_kpool,
+                mask_mode=3,
+            )
+            return self._pack_keypool_indices(
+                indices, query_metadata, self.topk_tokens, self.index_kpool, self.topk_indices_buffer
+            )
+        if self.kpool_int8:
+            query, q_descale = self._symmetric_int8(q_values)
+            op_weights = weights.to(torch.float16)
+        else:
+            query = q_values.to(indexer_cache.dtype)
+            q_descale = None
+            op_weights = weights.to(torch.bfloat16)
+        # CANN's TND path faults when every request has only a raw tail and no
+        # completed pool. A valid dummy request keeps that path well-defined.
+        # Prepend it unconditionally so graph capture and replay use one shape.
+        query = torch.cat((query.new_zeros((1, *query.shape[1:])), query), dim=0)
+        op_weights = torch.cat((op_weights.new_zeros((1, *op_weights.shape[1:])), op_weights), dim=0)
+        if q_descale is not None:
+            q_descale = torch.cat((q_descale.new_ones((1, *q_descale.shape[1:])), q_descale), dim=0)
+        pool_tail = torch.cat((query_metadata.pool_tail.new_zeros((1,)), query_metadata.pool_tail))
+        actual_seq_q = torch.cat((query_metadata.cum_query_lens.new_ones((1,)), query_metadata.cum_query_lens + 1))
+        actual_seq_k = torch.cat((query_metadata.seq_lens.new_ones((1,)), query_metadata.seq_lens))
+        block_table = torch.cat(
+            (
+                indexer_metadata.block_table.new_zeros((1, indexer_metadata.block_table.shape[1])),
+                indexer_metadata.block_table,
+            )
+        )
         indices, _ = self._pool_key_indexer(
             query,
             indexer_cache,
-            weights.to(torch.bfloat16),
-            query_metadata.pool_tail,
-            actual_seq_q=query_metadata.cum_query_lens,
-            actual_seq_k=query_metadata.seq_lens,
-            block_table=indexer_metadata.block_table,
+            op_weights,
+            pool_tail,
+            actual_seq_q=actual_seq_q,
+            actual_seq_k=actual_seq_k,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale_cache,
             layout_q="TND",
             layout_k="PA_BBND",
             topk=self.topk_tokens,
             pool_size=self.index_kpool,
             mask_mode=3,
+            quant_mode=2 if self.kpool_int8 else -1,
         )
         return self._pack_keypool_indices(
-            indices, query_metadata, self.topk_tokens, self.index_kpool, self.topk_indices_buffer
+            indices[1:], query_metadata, self.topk_tokens, self.index_kpool, self.topk_indices_buffer
         )
