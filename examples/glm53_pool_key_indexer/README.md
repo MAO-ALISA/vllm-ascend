@@ -1,28 +1,32 @@
 # GLM-5.3 Flash PoolKeyIndexer 双机 PD 性能复现
 
-这组脚本整理了 2026-10-28 至 29 日的测试配置。服务端使用两台各 16 卡的 A3 主机：P 为 `80.48.29.107`，D 为 `80.48.29.108`；压测端为 `80.5.17.120` 的 `aisbench_djc` 容器。地址、镜像、模型路径和挂载目录均可按环境修改。脚本不包含登录凭据。开始前确认设备空闲，并仅在本次测试容器中运行停止命令。
+这组脚本基于 vllm-ascend `b5e844b164ddefb97c0b44834336b6e2866db47c` 的 GLM-5.3 Flash 代码。默认 P 主机为 `80.5.9.103`、D 主机为 `80.5.9.110`，各有 16 张 A3 卡；地址、网卡、镜像、模型路径和挂载目录均可按环境修改。脚本不包含登录凭据。开始前确认设备空闲，并仅在本次测试容器中运行停止命令。
 
-自定义 C8/C16 模式还需要安装 [模型接入分支](https://github.com/MAO-ALISA/vllm-ascend/tree/codex/pool-key-indexer-c8-integration) 的代码；`main` 当前没有 `VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE` 开关。本目录保存测试与部署脚本，不会仅凭安装算子包就让模型调用自定义算子。该分支与本目录合用尚未在 NPU 上重新端到端验证。
+本补丁同时加入 `VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE` 模型开关。`builtin` 使用 CANN 内置算子，`c8` 使用自定义 INT8 算子，`c16` 使用自定义 BF16 算子。自定义路径显式使用 V2 索引布局；v3 新增的 `int8-only-ld-gate` 还要求运行时装箱损失达到 10%，A3 主形态按包文档预计不触发。模型代码、`.run` 和 `.whl` 必须同时安装在 P、D 两侧。
 
 ## 1. 创建容器和安装算子
 
-两台服务主机分别执行。镜像是当时 `docker inspect` 得到的实际镜像标签。脚本使用 `--privileged`、host 网络、32 GiB 共享内存，并挂载模型和 Ascend 驱动。
+两台服务主机分别执行。先设置 `VLLM_IMAGE` 为当前 b5e844 代码对应且与算子包 CANN 9.3.0 兼容的镜像。脚本使用 `--privileged`、host 网络、32 GiB 共享内存，并挂载模型和 Ascend 驱动。
 
 ```bash
-export WORK_ROOT=/data/mcy_pki_c8_int8perf_v2_final
-mkdir -p "$WORK_ROOT/scripts" "$WORK_ROOT/profile" "$WORK_ROOT/service_logs"
+export WORK_ROOT=/mnt/share/d00954433/pki_v3_103_110_20261029/staging
+export VLLM_IMAGE='your-vllm-ascend-cann9.3-image'
+mkdir -p "$WORK_ROOT/scripts" "$WORK_ROOT/profile_p" "$WORK_ROOT/profile_d" "$WORK_ROOT/service_logs"
 bash create_container.sh
 cp ./*.sh ./*.py "$WORK_ROOT/scripts/"
-docker exec glm53_flash_kpool_indexer_test_mcy bash "$WORK_ROOT/scripts/install_operator.sh"
+export PKI_PACKAGE_DIR=/mnt/share/d00954433/pki_v3_103_110_20261029/package
+docker exec -e PKI_PACKAGE_DIR="$PKI_PACKAGE_DIR" glm53_flash_kpool_indexer_test_mcy \
+  bash "$WORK_ROOT/scripts/install_operator.sh"
 ```
 
-`create_container.sh` 可用 `VLLM_IMAGE`、`CONTAINER_NAME`、`WORK_ROOT` 覆盖默认值。`install_operator.sh` 默认读取 `/mnt/share_space/d00954433/profiling/pki_c8_int8perf_v2_final/package`，也可通过 `PKI_PACKAGE_DIR` 指定包目录。它依次安装 `.run` 和 `.whl`，检查 Python binding、`aclnnPoolKeyIndexer` 符号，并在测试容器内设置自定义 OPP 优先级。算子包来源为 [pki_c8_int8perf_v2_final](https://gitcode.com/guijianwei/blueFIle/tree/main/poolkeyinderer/pki_c8_int8perf_v2_final)。
+`create_container.sh` 可用 `VLLM_IMAGE`、`CONTAINER_NAME`、`WORK_ROOT` 覆盖默认值。`PKI_PACKAGE_DIR` 必须指向下载后的 v3 包目录；`install_operator.sh` 校验主交付 `.run` 和 `.whl` 的 SHA256，然后安装两者并检查 Python binding、aclnn 符号与 kernel 文件。默认安装根目录为 `/opt/pki_c8_int8perf_v3_ldgate`。算子包来源为 [pki_c8_int8perf_v3_ldgate](https://gitcode.com/guijianwei/blueFIle/tree/main/poolkeyinderer/pki_c8_int8perf_v3_ldgate)，此处使用客户主交付臂，不使用 `dbgverify` 臂。该包按 CANN 9.3.0 构建，部署前应确认运行环境兼容。
 
-在两台容器中将模型接入分支安装为当前 `vllm_ascend`，确认 Python 实际加载的路径与版本；具体安装方式取决于镜像是否已做 editable 安装。示例：
+在两台容器中使用应用本补丁后的代码，确认 Python 实际加载的路径与版本；具体安装方式取决于镜像是否已做 editable 安装。示例：
 
 ```bash
-git clone --branch codex/pool-key-indexer-c8-integration \
-  https://github.com/MAO-ALISA/vllm-ascend.git /workspace/vllm-ascend-pki
+git clone --branch scripts https://github.com/MAO-ALISA/vllm-ascend.git /workspace/vllm-ascend-pki
+cd /workspace/vllm-ascend-pki
+git apply /path/to/glm53_pki_v3_scripts.patch
 python3 -m pip install -e /workspace/vllm-ascend-pki --no-deps
 python3 -c 'import vllm_ascend; print(vllm_ascend.__file__)'
 ```
@@ -32,8 +36,8 @@ python3 -c 'import vllm_ascend; print(vllm_ascend.__file__)'
 P 主机运行 `start-p`（2 个 DP rank，每 rank TP8）；D 主机运行 `start-d`（8 个 DP rank，每 rank TP2）和 `proxy`。两个主机的环境变量应使用相同 P/D 地址。每次切换 `builtin`、`c8`、`c16` 时，先在两台机器分别停止本次服务，再以同一模式启动，避免缓存和进程混杂。
 
 ```bash
-export WORK_ROOT=/data/mcy_pki_c8_int8perf_v2_final
-export PREFILL_HOST=80.48.29.107 DECODE_HOST=80.48.29.108
+export WORK_ROOT=/mnt/share/d00954433/pki_v3_103_110_20261029/staging
+export PREFILL_HOST=80.5.9.103 DECODE_HOST=80.5.9.110
 export PKI_MODE=c8  # builtin / c8 / c16
 
 # P 主机
@@ -71,20 +75,22 @@ cp /path/to/this-directory/config.py.example "$tools/config.py"
 
 | 场景 | 输入 / 输出 token | 命中目标 | 总并发 | 请求数 | 前置请求 |
 | --- | ---: | ---: | ---: | ---: | --- |
-| P4K | 4096 / 1 | 0% | 16（每 DP 8） | 32 | 无 |
-| P128K | 131072 / 1 | 90% | 4（每 DP 2） | 8 | 117964 / 1，2 条 |
-| D4K | 4096 / 2048 | 100% | 80（每 DP 10） | 80 | 4096 / 1，2 条 |
-| D128K | 131072 / 1024 | 100% | 80（每 DP 10） | 80 | 131072 / 1，2 条 |
+| P4K | 4096 / 1 | 0% | 200 | 200 | 无 |
+| P128K | 131072 / 1 | 90% | 200 | 200 | 117964 / 1，2 条 |
+| D4K | 4096 / 2048 | 100% | 80（每 DP 10） | 80 | 4096 / 1，8 条（每 DP 一条） |
+| D128K | 131072 / 1024 | 100% | 80（每 DP 10） | 80 | 131072 / 1，8 条（每 DP 一条） |
 
-上述命中率是请求构造目标，实际命中率应结合压测前后的 prefix cache metrics 核对。四个场景分别跑三种模式，共 12 组。`mode`、`scenario` 参数分别取 `builtin|c8|c16`、`p4k|p128k|d4k|d128k`。先以 `run_aisbench_case.sh` 检查常规 QPS、TTFT、ITL，再以 `profile_aisbench_case.py` 在单个 DP rank 开启短时间 profiling：
+上述命中率是请求构造目标，实际命中率应结合压测前后的 prefix cache metrics 核对。D 侧 8 条预热请求必须分别落到 8 个 DP rank，且主测数据应在每个 rank 复用对应预热前缀；仅有 8 条预热请求不能自动保证 100% 命中。四个场景分别跑三种模式，共 12 组。`mode`、`scenario` 参数分别取 `builtin|c8|c16`、`p4k|p128k|d4k|d128k`。先以 `run_aisbench_case.sh` 检查常规 QPS、TTFT、ITL，再以 `profile_aisbench_case.py` 在单个 DP rank 开启短时间 profiling：
 
 ```bash
 cd /mnt/share/d00954433/test_tools/aisbench_auto_tools_prefix
 bash run_aisbench_case.sh c8 d128k warmup
 bash run_aisbench_case.sh c8 d128k main
-python3 profile_aisbench_case.py c8 d128k --prefill-host 80.48.29.107 --decode-host 80.48.29.108 --rank-limit 1 --profile-seconds 3
+python3 profile_aisbench_case.py c8 d128k --prefill-host 80.5.9.103 --decode-host 80.5.9.110 --rank-limit 1 --profile-seconds 3
 ```
 
-`profile_aisbench_case.py` 会自行执行 warmup 和 main，故单独采 profile 时只需最后一条命令。P 侧 trace 在 P 主机，D 侧 trace 在 D 主机。开始每个 case 前在对应主机执行 `touch "$WORK_ROOT/profile/.before_c8_d128k"`；压测后执行 `bash "$WORK_ROOT/scripts/export_profile_case.sh" c8 d128k <预期trace目录数>`，生成 `operator_summary.json`。导出脚本会检查 trace 数量，不满足时不会汇总。比较 `PoolKeyIndexer` 前先确认 trace 中确实存在该算子调用。
+`profile_aisbench_case.py` 会自行执行 warmup 和 main，故单独采 profile 时只需最后一条命令。P 侧 trace 在 `$WORK_ROOT/profile_p`，D 侧 trace 在 `$WORK_ROOT/profile_d`。开始每个 case 前在对应主机执行 `touch "$WORK_ROOT/profile_d/.before_c8_d128k"`；压测后执行 `bash "$WORK_ROOT/scripts/export_profile_case.sh" c8 d128k <预期trace目录数>`，生成 `operator_summary.json`。导出脚本会检查 trace 数量，不满足时不会汇总。比较 `PoolKeyIndexer` 前先确认 trace 中确实存在该算子调用。
 
 脚本中的默认目录和端口复刻当时测试环境；复制到其他环境时需同步修改容器挂载、数据集文件名和服务地址。所有模式都应记录代码提交、算子包校验值、服务日志、实际 prefix cache 命中率与 ais-bench 结果，便于公平比较。
+
+**C8 PD 正确性限制：** 当前实现将 INT8 pooled key 写入可传输的 KV 缓存，但对应的 per-pool FP16 scale 存在进程本地张量中，没有接入 Mooncake 的 KV 传输。跨机 P→D 后若 D 直接使用这些 key，scale 可能缺失。必须先补齐 scale 的传输并完成输出一致性验证，才能将 C8 的 PD 测试结果用于最终性能结论。C16 和 builtin 不使用这份 scale 缓存。本文脚本仅提供 C8 的接入与实验入口，不代表其 PD 正确性已经验证。

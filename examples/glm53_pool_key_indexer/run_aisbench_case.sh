@@ -7,39 +7,41 @@ phase=${3:?warmup or main}
 root=${AISBENCH_TOOLS_ROOT:-/mnt/share/d00954433/test_tools/aisbench_auto_tools_prefix}
 data=${AISBENCH_DATASET_ROOT:-$root/mcy_datasets}
 model=${MODEL_BASENAME:-GLM-5.3-Flash-W8A8-1010-V1}
+p_dp=${P_DP_SIZE:-2}
+d_dp=${D_DP_SIZE:-8}
 cd "$root"
 
 case "$scenario" in
   p4k)
     test "$phase" = main || exit 0
-    args=(--input_len 4096 --output_len 1 --data_num 32 --concurrency 16
-      --dataset "$data/GSM8K-in4096-num32-$model.jsonl" --dp 2 --seed 5341)
+    args=(--input_len 4096 --output_len 1 --data_num 200 --concurrency 200
+      --dataset "$data/GSM8K-in4096-num200-$model.jsonl" --dp "$p_dp" --seed 5341)
     ;;
   p128k)
     if [[ "$phase" == warmup ]]; then
       args=(--input_len 117964 --output_len 1 --data_num 2 --concurrency 2
-        --dataset "$data/prefix-GSM8K-in117964-num2-$model.jsonl" --dp 2 --seed 5342)
+        --dataset "$data/prefix-GSM8K-in117964-num2-$model.jsonl" --dp "$p_dp" --seed 5342)
     else
-      args=(--input_len 131072 --output_len 1 --data_num 8 --concurrency 4
-        --dataset "$data/GSM8K-in131072-num8-$model-repeatRate0.9.jsonl" --dp 2 --seed 5342)
+      args=(--input_len 131072 --output_len 1 --data_num 200 --concurrency 200
+        --dataset "$data/GSM8K-in131072-num200-$model-repeatRate0.9.jsonl" --dp "$p_dp" --seed 5342)
     fi
     ;;
   d4k)
     if [[ "$phase" == warmup ]]; then
-      args=(--input_len 4096 --output_len 1 --data_num 2 --concurrency 2
-        --dataset "$data/prefix-GSM8K-in4096-num2-$model.jsonl" --dp 2 --seed 5343)
+      args=(--input_len 4096 --output_len 1 --data_num 8 --concurrency 8
+        --dataset "$data/prefix-GSM8K-in4096-num8-$model.jsonl" --dp "$d_dp" --seed 5343)
     else
       args=(--input_len 4096 --output_len 2048 --data_num 80 --concurrency 80
-        --dataset "$data/GSM8K-in4096-num80-$model-repeatRate1.0.jsonl" --dp 2 --seed 5343)
+        --dataset "$data/GSM8K-in4096-num80-$model-repeatRate1.0.jsonl" --dp "$d_dp" --seed 5343)
     fi
     ;;
   d128k)
     if [[ "$phase" == warmup ]]; then
-      args=(--input_len 131072 --output_len 1 --data_num 2 --concurrency 2
-        --dataset "$data/prefix-GSM8K-in131072-num2-$model.jsonl" --dp 2 --seed 5344)
+      args=(--input_len 131072 --output_len 1 --data_num 8 --concurrency 8
+        --dataset "$data/prefix-GSM8K-in131072-num8-$model.jsonl" --dp "$d_dp" --seed 5344)
     else
       args=(--input_len 131072 --output_len 1024 --data_num 80 --concurrency 80
-        --dataset "$data/GSM8K-in131072-num80-$model-repeatRate1.0.jsonl" --dp 2 --seed 5344)
+        --dataset "$data/GSM8K-in131072-num80-$model-repeatRate1.0.jsonl" --dp "$d_dp" --seed 5344)
     fi
     ;;
   *) echo "unknown scenario: $scenario" >&2; exit 2 ;;

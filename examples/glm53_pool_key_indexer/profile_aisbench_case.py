@@ -69,8 +69,8 @@ def main():
     parser.add_argument("--prefill-delay-seconds", type=float, default=0)
     parser.add_argument("--rank-limit", type=int, default=1,
                         help="number of DP rank endpoints to profile, starting at DP0")
-    parser.add_argument("--prefill-host", default="80.48.29.107")
-    parser.add_argument("--decode-host", default="80.48.29.108")
+    parser.add_argument("--prefill-host", default="80.5.9.103")
+    parser.add_argument("--decode-host", default="80.5.9.110")
     args = parser.parse_args()
 
     is_prefill = args.scenario.startswith("p")

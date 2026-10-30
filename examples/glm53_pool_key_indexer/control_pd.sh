@@ -3,13 +3,13 @@ set -euo pipefail
 
 action=${1:?start-p, start-d, proxy, status, stop}
 container=${CONTAINER_NAME:-glm53_flash_kpool_indexer_test_mcy}
-root=${WORK_ROOT:-/data/mcy_pki_c8_int8perf_v2_final}
-prefill_host=${PREFILL_HOST:-80.48.29.107}
-decode_host=${DECODE_HOST:-80.48.29.108}
+root=${WORK_ROOT:-/mnt/share/d00954433/pki_v3_103_110_20261029/staging}
+prefill_host=${PREFILL_HOST:-80.5.9.103}
+decode_host=${DECODE_HOST:-80.5.9.110}
 mode=${PKI_MODE:-c8}
+vendor=${PKI_VENDOR_PATH:-/opt/pki_c8_int8perf_v3_ldgate/vendors/pool_key_indexer_transformer}
 case "$mode" in
-  c8) vendor=/opt/pki_c8_int8perf_v2_final/vendors/pool_key_indexer_transformer ;;
-  c16) vendor=/opt/pki_c8_int8perf_v2_final/vendors/pool_key_indexer_transformer ;;
+  c8|c16) ;;
   builtin) vendor= ;;
   *) echo "unknown mode: $mode" >&2; exit 2 ;;
 esac

@@ -72,6 +72,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # GLM-5.3 KPool indexer implementation: "builtin" (default), "c8" (INT8
+    # pooled keys), or "c16" (BF16 pooled keys). The custom modes require the
+    # matching PoolKeyIndexer operator package; this is not a sensitive value.
+    "VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE": lambda: os.getenv("VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE", "builtin"),
 }
 
 # end-env-vars-definition

@@ -29,6 +29,7 @@ from vllm.model_executor.models.deepseek_v2 import (
     yarn_get_mscale,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.models.glm5next.kv_cache import (
     Glm5NextIndexerCache,
     Glm5NextTailCache,
@@ -98,10 +99,12 @@ class Indexer(nn.Module):
         self.scale_fmt = None
         self.quant_block_size = self.head_dim
         self.topk_indices_buffer = topk_indices_buffer
-        # Completed pools store BF16 vectors without quantization scales.
+        # The matching scale cache is allocated by the Ascend backend using the
+        # same physical pool slots. Keep BF16 as the default for rollback.
+        self.kpool_int8 = envs.VLLM_ASCEND_GLM5_KPOOL_INDEXER_MODE == "c8"
         self.k_cache = Glm5NextIndexerCache(
             head_dim=self.head_dim,
-            dtype=torch.bfloat16,
+            dtype=torch.int8 if self.kpool_int8 else torch.bfloat16,
             cache_role="indexer",
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,

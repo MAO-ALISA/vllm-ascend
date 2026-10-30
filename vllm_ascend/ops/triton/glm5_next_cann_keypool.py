@@ -14,6 +14,8 @@ def _write_keypool_caches_kernel(
     key,
     gate,
     pooled,
+    scale_cache,
+    pooled_scales,
     writes,
     state_rows,
     state,
@@ -30,6 +32,7 @@ def _write_keypool_caches_kernel(
     INPUT_STRIDE,
     INPUT_WIDTH,
     SPECULATIVE: tl.constexpr,
+    QUANTIZED: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -55,13 +58,23 @@ def _write_keypool_caches_kernel(
         pool_value = tl.load(pooled + pool_row * POOLED_STRIDE + cols, valid & (cols < HEAD_DIM), other=0)
         address = cache + slot // BLOCK_SIZE * CACHE_STRIDE + slot % BLOCK_SIZE * HEAD_DIM + cols
         tl.store(address, pool_value, valid & (cols < HEAD_DIM))
+        if QUANTIZED:
+            scale = tl.load(pooled_scales + pool_row, valid, other=1)
+            tl.store(scale_cache + slot, scale, valid)
 
 
-def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata, state):
+def write_keypool_caches(
+    tail, cache, key, gate, pooled, metadata, tail_metadata, state, *, k_descale_cache=None, pooled_scales=None
+):
     inputs = tail_metadata.cann_inputs
     writes = inputs.write_indices
     tail_rows = writes.numel()
     pooled_rows = pooled.shape[0]
+    quantized = k_descale_cache is not None
+    if quantized != (pooled_scales is not None):
+        raise ValueError("INT8 KPool cache and pooled scales must be provided together.")
+    if quantized and (k_descale_cache.shape != cache.shape[:-1] or pooled_scales.shape != (pooled_rows,)):
+        raise ValueError("INT8 KPool scale shapes must match physical cache slots and pooled rows.")
     # Each program writes one row: tail rows first, then pooled rows.
     _write_keypool_caches_kernel[(tail_rows + pooled_rows,)](
         tail,
@@ -69,6 +82,8 @@ def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata
         key,
         gate,
         pooled,
+        k_descale_cache,
+        pooled_scales,
         writes,
         inputs.state_indices,
         state,
@@ -85,6 +100,7 @@ def write_keypool_caches(tail, cache, key, gate, pooled, metadata, tail_metadata
         writes.stride(0),
         writes.shape[1],
         key is not None,
+        quantized,
         triton.next_power_of_2(2 * cache.shape[-1]),
     )
 

@@ -4,9 +4,13 @@ set -euo pipefail
 mode=${1:?mode}
 scenario=${2:?scenario}
 expected=${3:?expected TP trace count}
-work_root=${WORK_ROOT:-/data/mcy_pki_c8_int8perf_v2_final}
+work_root=${WORK_ROOT:-/mnt/share/d00954433/pki_v3_103_110_20261029/staging}
 container=${CONTAINER_NAME:-glm53_flash_kpool_indexer_test_mcy}
-root=$work_root/profile
+case "$scenario" in
+  p*) root=${PROFILE_ROOT:-$work_root/profile_p} ;;
+  d*) root=${PROFILE_ROOT:-$work_root/profile_d} ;;
+  *) echo "Unknown scenario: $scenario" >&2; exit 2 ;;
+esac
 marker="$root/.before_${mode}_${scenario}"
 out="$root/exports/${mode}/${scenario}"
 test -f "$marker"

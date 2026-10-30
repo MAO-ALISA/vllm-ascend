@@ -5,10 +5,10 @@
 export ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["hccs:device"]}'
 export ASCEND_LOCAL_COMM_RES='{"version":"1.2"}'
 
-LOCAL_IP=${LOCAL_IP:-80.48.29.108}
-NIC_NAME=${NIC_NAME:-enp210s0f0}
+LOCAL_IP=${LOCAL_IP:-80.5.9.110}
+NIC_NAME=${NIC_NAME:-enp48s3u1u1}
 MODEL_PATH=${MODEL_PATH:-/mnt/share/w00936111/weights/GLM-5.3-Flash-W8A8-1010-V1}
-PROFILE_ROOT=${PROFILE_ROOT:-/data/mcy_pki_c8_int8perf_v2_final/profile}
+PROFILE_ROOT=${PROFILE_ROOT:-/mnt/share/d00954433/pki_v3_103_110_20261029/staging/profile_d}
 
 export HCCL_IF_IP="$LOCAL_IP"
 export GLOO_SOCKET_IFNAME="$NIC_NAME"
@@ -42,7 +42,7 @@ exec vllm serve "$MODEL_PATH" \
 --max-num-batched-tokens 192 \
 --trust-remote-code \
 --quantization ascend \
---limit-mm-per-prompt '{"image": 7, "video": 0}' \
+--limit-mm-per-prompt '{"image": 0, "video": 0}' \
 --gpu-memory-utilization 0.92 \
 --tool-call-parser glm47 \
 --reasoning-parser glm45 \
