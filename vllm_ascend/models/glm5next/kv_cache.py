@@ -110,6 +110,8 @@ class Glm5NextIndexerCache(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_dim,
             dtype=self.dtype,
+            scale_dim=1 if self.dtype == torch.int8 else 0,
+            scale_dtype=torch.float16 if self.dtype == torch.int8 else torch.int8,
             cache_dtype_str=None,
             model_version="glm5_next",
             indexes_kv_by_block_stride=True,

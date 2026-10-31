@@ -49,6 +49,9 @@ class Indexer(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+        indexer_dtype = vllm_config.attention_config.indexer_kv_dtype
+        if indexer_dtype not in ("auto", "bf16", "int8"):
+            raise ValueError(f"GLM KPool indexer_kv_dtype must be auto, bf16 or int8, got {indexer_dtype!r}.")
         self.vllm_config = vllm_config
         self.config = config
         self.quant_config = quant_config
@@ -98,10 +101,10 @@ class Indexer(nn.Module):
         self.scale_fmt = None
         self.quant_block_size = self.head_dim
         self.topk_indices_buffer = topk_indices_buffer
-        # Completed pools store BF16 vectors without quantization scales.
+        # INT8 completed pools store per-vector FP16 scales in the same cache pages.
         self.k_cache = Glm5NextIndexerCache(
             head_dim=self.head_dim,
-            dtype=torch.bfloat16,
+            dtype=torch.int8 if indexer_dtype == "int8" else torch.bfloat16,
             cache_role="indexer",
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,

@@ -336,6 +336,7 @@ def test_backend_uses_normalized_q_c_and_separate_tail_metadata(
 ) -> None:
     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
     nn.Module.__init__(backend)
+    backend.kpool_int8 = False
     backend.n_head = 2
     backend.head_dim = 2
     backend.topk_tokens = 2
@@ -540,6 +541,7 @@ def test_cann_indexer_writes_caches_before_optional_selection(
 def test_backend_restores_pcp_keys_before_kpool_cache_write(monkeypatch, pcp_local_token_count, actual_tokens) -> None:
     backend = Glm5NextKPoolIndexerBackend.__new__(Glm5NextKPoolIndexerBackend)
     nn.Module.__init__(backend)
+    backend.kpool_int8 = False
     backend.n_head = 2
     backend.head_dim = 2
     backend.topk_tokens = 2

@@ -9,9 +9,11 @@ classes: main MLA/KDA pages and compressed-indexer/tail pages.
 """
 
 from dataclasses import dataclass
+from math import lcm
 
 from vllm.config import VllmConfig
 from vllm.model_executor.models.utils import extract_layer_index
+from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -22,7 +24,12 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
-from vllm_ascend.core.kv_cache_interface import AscendIndexerKPoolTailSpec, get_kv_cache_compression_ratio
+from vllm_ascend.core.kv_cache_interface import (
+    AscendIndexerKPoolTailSpec,
+    AscendMLAAttentionSpec,
+    get_kv_cache_compression_ratio,
+    get_storage_block_size,
+)
 from vllm_ascend.utils import vllm_version_is
 
 # vLLM #61183 moved these helpers to `kv_cache_planning` on main; the v0.32.0
@@ -120,6 +127,16 @@ def _align_glm5_next_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]) -> None:
         max(spec.page_size_bytes for spec in small_candidates),
         max(_unpadded_page_size(spec) for spec in small_candidates),
     )
+
+    scale_alignments = tuple(
+        get_storage_block_size(spec) * get_dtype_size(spec.scale_dtype)
+        for spec in indexer_specs
+        if isinstance(spec, AscendMLAAttentionSpec) and spec.scale_dim
+    )
+    if scale_alignments:
+        # Shared pages must retain complete FP32 tail rows and scale alignment.
+        alignment = lcm(*(_unpadded_page_size(spec) // spec.block_size for spec in tail_specs), *scale_alignments)
+        small_page_size = (small_page_size + alignment - 1) // alignment * alignment
 
     for spec in main_candidates:
         object.__setattr__(spec, "page_size_padded", main_page_size)
